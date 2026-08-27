@@ -92,7 +92,7 @@ private enum AppLog {
         let line = "\(formatter.string(from: Date())) [pid:\(ProcessInfo.processInfo.processIdentifier)] \(message)\n"
         if let data = line.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: url.path), let handle = try? FileHandle(forWritingTo: url) {
-                try? handle.seekToEnd()
+                _ = try? handle.seekToEnd()
                 try? handle.write(contentsOf: data)
                 try? handle.close()
             } else {
@@ -123,11 +123,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var todoPopoverController: TodoPopoverController?
     private var todoEscapeMonitor: Any?
 
+    private var isTodoCompanion: Bool {
+        ProcessInfo.processInfo.arguments.contains("--todos-only") ||
+            Bundle.main.bundleIdentifier == "io.github.jasonhuff.quick-entry.todos"
+    }
+
+    private var embeddedTodoMenuEnabled: Bool {
+        ProcessInfo.processInfo.environment["QUICK_ENTRY_TODOS"] != "0"
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.write("applicationDidFinishLaunching; launchedByLaunchAgent=\(launchedByLaunchAgent); XPC_SERVICE_NAME=\(ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] ?? "nil")")
         NSApp.setActivationPolicy(.accessory)
+        if isTodoCompanion {
+            setupStatusItem()
+            AppLog.write("todo companion launch detected; staying in menu bar")
+            return
+        }
+
         setupAppleEventHandlers()
-        setupStatusItem()
+        if embeddedTodoMenuEnabled {
+            setupStatusItem()
+        }
         registerHotKey()
 
         if !launchedByLaunchAgent {
@@ -140,7 +157,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         AppLog.write("applicationShouldHandleReopen; hasVisibleWindows=\(flag)")
-        openQuickEntry()
+        if isTodoCompanion {
+            toggleTodoPopover()
+        } else {
+            openQuickEntry()
+        }
         return true
     }
 
@@ -211,7 +232,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             },
             onToggle: { [weak self] lineIndex in
                 self?.toggleTodoFromPopover(atLineIndex: lineIndex)
-            }
+            },
+            showsQuickEntryAction: !isTodoCompanion
         )
 
         let popover = NSPopover()
@@ -256,7 +278,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func updateStatusTitle() {
         statusItem?.button?.image = nil
         statusItem?.button?.imagePosition = .noImage
-        statusItem?.button?.title = "Quick"
+        if isTodoCompanion {
+            statusItem?.button?.title = "☑︎"
+            statusItem?.button?.font = .systemFont(ofSize: 16, weight: .medium)
+            statusItem?.button?.contentTintColor = .labelColor
+            statusItem?.button?.toolTip = "Quick Entry To-dos — \(QuickEntryStore.openTodoCount()) open"
+        } else {
+            statusItem?.button?.title = "Quick"
+            statusItem?.button?.toolTip = "\(appName) — \(hotKeyDescription)"
+        }
         statusItem?.length = NSStatusItem.variableLength
     }
 
@@ -331,13 +361,21 @@ final class TodoPopoverController: NSViewController {
     private let onReveal: () -> Void
     private let onQuit: () -> Void
     private let onToggle: (Int) -> Void
+    private let showsQuickEntryAction: Bool
     private let stack = NSStackView()
 
-    init(onQuickEntry: @escaping () -> Void, onReveal: @escaping () -> Void, onQuit: @escaping () -> Void, onToggle: @escaping (Int) -> Void) {
+    init(
+        onQuickEntry: @escaping () -> Void,
+        onReveal: @escaping () -> Void,
+        onQuit: @escaping () -> Void,
+        onToggle: @escaping (Int) -> Void,
+        showsQuickEntryAction: Bool
+    ) {
         self.onQuickEntry = onQuickEntry
         self.onReveal = onReveal
         self.onQuit = onQuit
         self.onToggle = onToggle
+        self.showsQuickEntryAction = showsQuickEntryAction
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -373,7 +411,9 @@ final class TodoPopoverController: NSViewController {
 
         let openTodos = QuickEntryStore.todoItems().filter { !$0.isDone }
         add(QuickEntryMenuHeaderView(openTodoCount: openTodos.count))
-        add(QuickEntryMenuActionView(title: "Quick Entry", detail: hotKeyDescription, icon: "✎", onPress: onQuickEntry))
+        if showsQuickEntryAction {
+            add(QuickEntryMenuActionView(title: "Quick Entry", detail: hotKeyDescription, icon: "✎", onPress: onQuickEntry))
+        }
         add(QuickEntryMenuSectionView(title: openTodos.isEmpty ? "Today" : "Today"))
 
         if openTodos.isEmpty {
@@ -389,7 +429,8 @@ final class TodoPopoverController: NSViewController {
 
         add(QuickEntryMenuActionView(title: "Reveal Todo Inbox", detail: "Markdown", icon: "⌘", onPress: onReveal))
 
-        let height = 48 + 34 + 28 + (openTodos.isEmpty ? 42 : min(openTodos.count, 12) * 39) + (openTodos.count > 12 ? 28 : 0) + 34
+        let quickEntryActionHeight = showsQuickEntryAction ? 34 : 0
+        let height = 48 + quickEntryActionHeight + 28 + (openTodos.isEmpty ? 42 : min(openTodos.count, 12) * 39) + (openTodos.count > 12 ? 28 : 0) + 34
         preferredContentSize = NSSize(width: 344, height: min(max(height, 220), 620))
         view.setFrameSize(preferredContentSize)
     }

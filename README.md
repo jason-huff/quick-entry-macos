@@ -70,6 +70,22 @@ QUICK_ENTRY_TODO_FILE="$HOME/Documents/inbox.md" ./build.sh
 
 The configured path is stored in the generated launch agent. Re-run the command after changing it.
 
+### Optional To-dos companion
+
+Quick Entry can run its to-do surface as a separate, menu-bar-only companion app. The companion has no global capture hotkey; it reads and checks off the same local Markdown file as Quick Entry.
+
+```bash
+QUICK_ENTRY_TODO_COMPANION=1 ./build.sh
+```
+
+This installs **Quick Entry To-dos.app** and starts it at login. In companion mode, the main Quick Entry app keeps `Ctrl+Space` capture and yields its embedded to-do menu to the companion, so there is only one checklist icon.
+
+To return to the embedded to-do menu and remove the companion:
+
+```bash
+QUICK_ENTRY_TODO_COMPANION=0 ./build.sh
+```
+
 ## Writing mode
 
 Writing mode calls the bundled [`write-without-bullshit` skill](skills/write-without-bullshit/SKILL.md) through Pi.
