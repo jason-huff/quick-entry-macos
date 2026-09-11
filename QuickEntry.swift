@@ -1,17 +1,20 @@
 import AppKit
 import Carbon.HIToolbox
+import CryptoKit
 import QuartzCore
 
-private let appName = "Quick Entry"
-private let hotKeyDescription = "⌃Space"
 private let hotKeyID = EventHotKeyID(signature: OSType(0x51454E54), id: 1) // QENT
-private let modeContentTransitionDuration: CFTimeInterval = 0.22
 
 private enum QuickEntryConfiguration {
     static let launchAgentLabel = "io.github.jasonhuff.quick-entry"
+    static let todoCompanionBundleID = "io.github.jasonhuff.quick-entry.todos"
     static let defaultInboxDirectory = "QuickEntry"
     static let defaultInboxFileName = "todo-processing.md"
 }
+private let modeContentTransitionDuration: CFTimeInterval = 0.22
+// NSStatusItem.squareLength is zero on recent macOS releases. Keep a concrete
+// width so the menu bar allocates a visible hit target for the to-do icon.
+private let todoStatusItemLength: CGFloat = 26
 
 enum ModeTextRollDirection {
     case up
@@ -69,15 +72,212 @@ private func qColor(_ hex: UInt32, alpha: CGFloat = 1) -> NSColor {
     return NSColor(srgbRed: r, green: g, blue: b, alpha: alpha)
 }
 
-struct TodoMenuEntry {
+private func markdownLabel(_ text: String, font: NSFont, color: NSColor) -> NSAttributedString {
+    let result = NSMutableAttributedString()
+    let pattern = try? NSRegularExpression(pattern: "\\*\\*(.+?)\\*\\*", options: [])
+    let nsText = text as NSString
+    let matches = pattern?.matches(in: text, range: NSRange(location: 0, length: nsText.length)) ?? []
+    var cursor = 0
+
+    for match in matches {
+        if match.range.location > cursor {
+            let plain = nsText.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+            result.append(NSAttributedString(string: plain, attributes: [.font: font, .foregroundColor: color]))
+        }
+        let boldRange = match.range(at: 1)
+        let bold = nsText.substring(with: boldRange)
+        result.append(NSAttributedString(
+            string: bold,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: font.pointSize, weight: .semibold),
+                .foregroundColor: color,
+            ]
+        ))
+        cursor = match.range.location + match.range.length
+    }
+
+    if cursor < nsText.length {
+        let plain = nsText.substring(from: cursor)
+        result.append(NSAttributedString(string: plain, attributes: [.font: font, .foregroundColor: color]))
+    }
+
+    if matches.isEmpty {
+        return NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color])
+    }
+    return result
+}
+
+private struct TodoPresentation {
+    let title: String
+    let category: String?
+}
+
+private func todoPresentation(_ raw: String) -> TodoPresentation {
+    let text = raw.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+    let patterns = [
+        "^\\s*\\*\\*([^:]+):\\*\\*\\s*(.+)$",
+        "^\\s*((?:Vault|Hiring|People|Grid|Hardware|Pulse|Activation|Design System|Case)[^:]*):\\s*(.+)$",
+        "^\\s*((?:Weekly|Daily|Before|After|During|Next week|This week)[^:]*):\\s*(.+)$",
+    ]
+
+    for pattern in patterns {
+        guard let expression = try? NSRegularExpression(pattern: pattern),
+              let match = expression.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)),
+              match.numberOfRanges == 3
+        else { continue }
+        let source = text as NSString
+        let category = source.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+        let action = source.substring(with: match.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !action.isEmpty else { continue }
+
+        let timePrefixes = [("next week ", "Next week"), ("this week ", "This week"), ("today ", "Today"), ("tomorrow ", "Tomorrow")]
+        let lowercaseAction = action.lowercased()
+        if let prefix = timePrefixes.first(where: { lowercaseAction.hasPrefix($0.0) }) {
+            let remainder = String(action.dropFirst(prefix.0.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !remainder.isEmpty else { continue }
+            let verbFirst = remainder.prefix(1).uppercased() + remainder.dropFirst()
+            return TodoPresentation(title: verbFirst, category: "\(category) · \(prefix.1)")
+        }
+
+        let verbFirst = action.prefix(1).uppercased() + action.dropFirst()
+        return TodoPresentation(title: verbFirst, category: category)
+    }
+
+    return TodoPresentation(title: text, category: nil)
+}
+
+private func firstURLAndTitle(_ raw: String) -> (title: String, url: URL?) {
+    guard let expression = try? NSRegularExpression(pattern: #"https?://\S+"#),
+          let match = expression.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)),
+          let range = Range(match.range, in: raw)
+    else {
+        return (raw, nil)
+    }
+
+    let candidate = String(raw[range]).trimmingCharacters(in: CharacterSet(charactersIn: "()[]{}<>.,;:"))
+    let title = raw.replacingCharacters(in: range, with: "")
+    return (title, URL(string: candidate))
+}
+
+private func conciseMetadata(_ detail: String, category: String?) -> String {
+    let normalizedDetail = detail.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+    let normalizedCategory = category?.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+
+    func shortened(_ text: String, limit: Int) -> String {
+        guard text.count > limit else { return text }
+        let prefix = String(text.prefix(limit))
+        let lastSpace = prefix.lastIndex(of: " ") ?? prefix.endIndex
+        return String(prefix[..<lastSpace]) + "…"
+    }
+
+    guard let normalizedCategory, !normalizedCategory.isEmpty else {
+        return shortened(normalizedDetail, limit: 58)
+    }
+    let shortCategory = shortened(normalizedCategory, limit: 24)
+    let availableDetail = max(18, 58 - shortCategory.count - 3)
+    return "\(shortened(normalizedDetail, limit: availableDetail)) · \(shortCategory)"
+}
+
+enum TodoSource: String, Codable, CaseIterable {
+    case owing
+    case inbox
+
+    var title: String {
+        switch self {
+        case .owing: return "Owing"
+        case .inbox: return "Inbox"
+        }
+    }
+
+}
+
+struct TodoMenuEntry: Identifiable {
+    let id: String
+    let source: TodoSource
     let lineIndex: Int
     let timestamp: String?
     let text: String
     let isDone: Bool
 }
 
+struct HyperDTodoRecommendation: Decodable {
+    let id: String
+    let why: String
+}
+
+struct HyperDTodoCache: Decodable {
+    let generatedAt: String
+    let mode: String
+    let summary: String
+    let radarReport: String?
+    let items: [HyperDTodoRecommendation]
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case mode
+        case summary
+        case radarReport = "radar_report"
+        case items
+    }
+}
+
+struct HyperDTodoEntry {
+    let todo: TodoMenuEntry
+    let why: String
+}
+
+struct InboxReviewItem: Decodable {
+    let id: String
+    let classification: String
+    let text: String
+}
+
+struct InboxReviewCache: Decodable {
+    let generatedAt: String
+    let mode: String
+    let rawCount: Int
+    let nonActionableCount: Int
+    let items: [InboxReviewItem]
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case mode
+        case rawCount = "raw_count"
+        case nonActionableCount = "non_actionable_count"
+        case items
+    }
+}
+
+struct TodoLogbookEntry: Codable, Identifiable {
+    let id: String
+    let completedAt: String
+    let todoID: String
+    let source: TodoSource
+    let text: String
+    let timestamp: String?
+    var restoredAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case completedAt = "completed_at"
+        case todoID = "todo_id"
+        case source
+        case text
+        case timestamp
+        case restoredAt = "restored_at"
+    }
+}
+
+struct SessionCompletedTodo {
+    let todo: TodoMenuEntry
+    let entry: TodoLogbookEntry
+    let detail: String
+}
+
 private extension Notification.Name {
-    static let quickEntryTodosChanged = Notification.Name("QuickEntryTodosChanged")
+    static let caseTodosChanged = Notification.Name("QuickEntryTodosChanged")
+    static let caseHyperDTodosChanged = Notification.Name("QuickEntryTopTodosChanged")
+    static let caseInboxReviewChanged = Notification.Name("QuickEntryInboxReviewChanged")
 }
 
 private enum AppLog {
@@ -103,7 +303,7 @@ private enum AppLog {
 }
 
 @main
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private static var retainedDelegate: AppDelegate?
 
     static func main() {
@@ -119,19 +319,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
     private var panelController: QuickEntryPanelController?
-    private var todoPopover: NSPopover?
+    private var todoPanel: TodoMenuPanel?
     private var todoPopoverController: TodoPopoverController?
     private var todoEscapeMonitor: Any?
+    private var todoOutsideMonitor: Any?
+    private var todoSyncTimer: Timer?
+    private var todoFingerprint = ""
+    private var hyperDRefreshInFlight = false
+    private var inboxReviewRefreshInFlight = false
+    private var isDismissingTodoPanel = false
 
     private var isTodoCompanion: Bool {
         ProcessInfo.processInfo.arguments.contains("--todos-only") ||
-            Bundle.main.bundleIdentifier == "io.github.jasonhuff.quick-entry.todos"
+            Bundle.main.bundleIdentifier == QuickEntryConfiguration.todoCompanionBundleID
     }
 
     private var embeddedTodoMenuEnabled: Bool {
-        // The optional companion owns the to-do surface. Only show the legacy
-        // embedded menu when the launch agent explicitly requests it, so a
-        // direct/Spotlight launch cannot create a second checklist icon.
+        // The to-do companion is a separate app. Only enable the legacy,
+        // embedded menu when the launch agent explicitly opts into it. A
+        // foreground/Spotlight launch has no launch-agent environment, and
+        // must never create a second to-do surface beside the companion.
         ProcessInfo.processInfo.environment["QUICK_ENTRY_TODOS"] == "1"
     }
 
@@ -140,6 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.setActivationPolicy(.accessory)
         if isTodoCompanion {
             setupStatusItem()
+            startTodoSync()
             AppLog.write("todo companion launch detected; staying in menu bar")
             return
         }
@@ -147,6 +355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         setupAppleEventHandlers()
         if embeddedTodoMenuEnabled {
             setupStatusItem()
+            startTodoSync()
         }
         registerHotKey()
 
@@ -170,6 +379,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         AppLog.write("applicationWillTerminate")
+        todoSyncTimer?.invalidate()
+        closeTodoPopover()
         if let hotKeyRef {
             let status = UnregisterEventHotKey(hotKeyRef)
             AppLog.write("UnregisterEventHotKey status=\(status)")
@@ -198,109 +409,321 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func setupStatusItem() {
         AppLog.write("setupStatusItem")
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let item = NSStatusBar.system.statusItem(withLength: todoStatusItemLength)
         item.button?.title = ""
-        item.button?.toolTip = "\(appName) — \(hotKeyDescription)"
-
+        item.button?.imagePosition = .imageOnly
         item.button?.target = self
         item.button?.action = #selector(toggleTodoPopover)
         statusItem = item
         updateStatusTitle()
+        logStatusItem("created")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.logStatusItem("one second after creation")
+        }
 
-        NotificationCenter.default.addObserver(forName: .quickEntryTodosChanged, object: nil, queue: .main) { [weak self] _ in
-            self?.updateStatusTitle()
-            self?.todoPopoverController?.rebuild()
+        NotificationCenter.default.addObserver(forName: .caseTodosChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.syncTodoState(force: true)
+        }
+        NotificationCenter.default.addObserver(forName: .caseHyperDTodosChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.syncTodoState(force: true)
+        }
+        NotificationCenter.default.addObserver(forName: .caseInboxReviewChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.syncTodoState(force: true)
         }
     }
 
     @objc private func toggleTodoPopover() {
         guard let button = statusItem?.button else { return }
-        if let todoPopover, todoPopover.isShown {
+        if let todoPanel, todoPanel.isVisible {
             closeTodoPopover()
             return
         }
 
         let controller = TodoPopoverController(
-            onQuickEntry: { [weak self] in
+            onRevealSource: { [weak self] source in
                 self?.closeTodoPopover()
-                self?.openQuickEntry()
+                self?.revealTodoSource(source)
             },
-            onReveal: { [weak self] in
-                self?.closeTodoPopover()
-                self?.revealTodoInbox()
+            onToggle: { [weak self] todo in
+                self?.toggleTodoFromPopover(todo)
             },
-            onQuit: { [weak self] in
-                self?.closeTodoPopover()
-                self?.quit()
+            onRestoreLogbook: { [weak self] entry in
+                self?.restoreLogbookEntry(entry)
             },
-            onToggle: { [weak self] lineIndex in
-                self?.toggleTodoFromPopover(atLineIndex: lineIndex)
+            onRefreshHyperD: { [weak self] in
+                self?.refreshHyperD(force: true)
             },
-            showsQuickEntryAction: !isTodoCompanion
-        )
-
-        let popover = NSPopover()
-        popover.behavior = .transient
-        popover.animates = true
-        popover.delegate = self
-        popover.contentViewController = controller
-        todoPopover = popover
-        todoPopoverController = controller
-        AppLog.write("showing todo popover")
-        installTodoEscapeMonitor()
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-    }
-
-    private func closeTodoPopover() {
-        todoPopover?.performClose(nil)
-        removeTodoEscapeMonitor()
-    }
-
-    func popoverDidClose(_ notification: Notification) {
-        removeTodoEscapeMonitor()
-    }
-
-    private func installTodoEscapeMonitor() {
-        removeTodoEscapeMonitor()
-        todoEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == UInt16(kVK_Escape), self?.todoPopover?.isShown == true {
-                self?.closeTodoPopover()
-                return nil
+            onPreferredSizeChange: { [weak self] size in
+                self?.resizeTodoPanel(to: size)
             }
-            return event
+        )
+        _ = controller.view
+        let size = controller.preferredContentSize
+        let panel = TodoMenuPanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.hidesOnDeactivate = false
+        panel.contentViewController = controller
+        let targetFrame = todoPanelFrame(for: button, size: size)
+        panel.setFrame(targetFrame, display: false)
+        panel.alphaValue = 0
+
+        todoPanel = panel
+        todoPopoverController = controller
+        controller.prepareForPresentation()
+        AppLog.write("showing borderless todo panel")
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        controller.animatePresentation()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.24
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 1.08, 0.4, 1)
+            panel.animator().alphaValue = 1
+        }
+        // Install outside-click handling after this status-item click has finished.
+        // Installing it synchronously consumes the same click that opened the panel.
+        DispatchQueue.main.async { [weak self, weak panel] in
+            guard let self, let panel, self.todoPanel === panel, panel.isVisible else { return }
+            self.installTodoDismissMonitors()
         }
     }
 
-    private func removeTodoEscapeMonitor() {
+    private func todoPanelFrame(for button: NSStatusBarButton, size: NSSize) -> NSRect {
+        let buttonRect = button.convert(button.bounds, to: nil)
+        let anchor = button.window?.convertToScreen(buttonRect) ?? .zero
+        let screenFrame = button.window?.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
+        let horizontalInset: CGFloat = 8
+        let x = min(
+            max(anchor.midX - size.width / 2, screenFrame.minX + horizontalInset),
+            screenFrame.maxX - size.width - horizontalInset
+        )
+        let y = max(screenFrame.minY + horizontalInset, anchor.minY - size.height - 5)
+        return NSRect(x: x, y: y, width: size.width, height: size.height)
+    }
+
+    private func statusButtonScreenFrame() -> NSRect? {
+        guard let button = statusItem?.button, let window = button.window else { return nil }
+        return window.convertToScreen(button.convert(button.bounds, to: nil))
+    }
+
+    private func closeTodoPopover() {
+        guard let panel = todoPanel else {
+            removeTodoDismissMonitors()
+            return
+        }
+        guard !isDismissingTodoPanel else { return }
+        isDismissingTodoPanel = true
+        removeTodoDismissMonitors()
+        let controller = todoPopoverController
+        controller?.animateDismissal()
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            panel.animator().alphaValue = 0
+        } completionHandler: { [weak self, weak panel] in
+            guard let self, let panel else { return }
+            panel.orderOut(nil)
+            panel.alphaValue = 1
+            controller?.resetCardTransform()
+            if self.todoPanel === panel {
+                self.todoPanel = nil
+                self.todoPopoverController = nil
+            }
+            self.isDismissingTodoPanel = false
+        }
+    }
+
+    private func resizeTodoPanel(to size: NSSize) {
+        guard let panel = todoPanel,
+              let button = statusItem?.button,
+              panel.isVisible,
+              !isDismissingTodoPanel
+        else { return }
+
+        var targetFrame = todoPanelFrame(for: button, size: size)
+        // The panel keeps a fixed width. Preserve its exact x-origin during
+        // vertical resize so submenus never nudge left/right by a pixel.
+        targetFrame.origin.x = panel.frame.origin.x
+        guard abs(panel.frame.width - targetFrame.width) > 0.5 || abs(panel.frame.height - targetFrame.height) > 0.5 else {
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.22
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.18, 0.9, 0.24, 1)
+            panel.animator().setFrame(targetFrame, display: true)
+        } completionHandler: { [weak self] in
+            self?.todoPopoverController?.refreshOverflowFades()
+        }
+    }
+
+    private func installTodoDismissMonitors() {
+        removeTodoDismissMonitors()
+        todoEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, let panel = self.todoPanel, panel.isVisible else { return event }
+            if event.type == .keyDown, event.keyCode == UInt16(kVK_Escape) {
+                self.closeTodoPopover()
+                return nil
+            }
+            if event.type == .leftMouseDown || event.type == .rightMouseDown,
+               !panel.frame.contains(NSEvent.mouseLocation),
+               !(self.statusButtonScreenFrame()?.contains(NSEvent.mouseLocation) ?? false) {
+                self.closeTodoPopover()
+            }
+            return event
+        }
+        todoOutsideMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if !(self.statusButtonScreenFrame()?.contains(NSEvent.mouseLocation) ?? false) {
+                    self.closeTodoPopover()
+                }
+            }
+        }
+    }
+
+    private func removeTodoDismissMonitors() {
         if let todoEscapeMonitor {
             NSEvent.removeMonitor(todoEscapeMonitor)
             self.todoEscapeMonitor = nil
         }
+        if let todoOutsideMonitor {
+            NSEvent.removeMonitor(todoOutsideMonitor)
+            self.todoOutsideMonitor = nil
+        }
+    }
+
+    private func logStatusItem(_ phase: String) {
+        guard let item = statusItem else {
+            AppLog.write("status item [\(phase)]: missing")
+            return
+        }
+        guard let button = item.button else {
+            AppLog.write("status item [\(phase)]: button missing; length=\(item.length)")
+            return
+        }
+        AppLog.write(
+            "status item [\(phase)]: length=\(item.length); hidden=\(button.isHidden); " +
+            "frame=\(NSStringFromRect(button.frame)); window=\(String(describing: button.window)); " +
+            "title=\(button.title.debugDescription); attributedTitle=\(button.attributedTitle.string.debugDescription); " +
+            "image=\(String(describing: button.image)); imagePosition=\(button.imagePosition.rawValue)"
+        )
     }
 
     private func updateStatusTitle() {
+        let openCount = QuickEntryStore.openTodoCount()
+        // Keep this deliberately simple. Use the system label color instead
+        // of hard-coded black so the dot remains visible when macOS switches
+        // the menu bar between light and dark appearances.
+        let title = NSAttributedString(
+            string: "●",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 18, weight: .regular),
+                .foregroundColor: NSColor.labelColor,
+                .baselineOffset: -1,
+            ]
+        )
+
         statusItem?.button?.image = nil
         statusItem?.button?.imagePosition = .noImage
-        if isTodoCompanion {
-            statusItem?.button?.title = "☑︎"
-            statusItem?.button?.font = .systemFont(ofSize: 16, weight: .medium)
-            statusItem?.button?.contentTintColor = .labelColor
-            statusItem?.button?.toolTip = "Quick Entry To-dos — \(QuickEntryStore.openTodoCount()) open"
-        } else {
-            statusItem?.button?.title = "Quick"
-            statusItem?.button?.toolTip = "\(appName) — \(hotKeyDescription)"
-        }
-        statusItem?.length = NSStatusItem.variableLength
+        statusItem?.button?.title = ""
+        statusItem?.button?.attributedTitle = title
+        statusItem?.button?.contentTintColor = nil
+        statusItem?.button?.toolTip = "Quick Entry to-dos — \(openCount) open"
+        statusItem?.button?.setAccessibilityLabel("Quick Entry to-dos, \(openCount) open")
+        statusItem?.length = todoStatusItemLength
     }
 
-    private func toggleTodoFromPopover(atLineIndex lineIndex: Int) {
-        do {
-            try QuickEntryStore.toggleTodo(atLineIndex: lineIndex)
-            AppLog.write("toggled todo at lineIndex=\(lineIndex)")
-            updateStatusTitle()
+    private func startTodoSync() {
+        syncTodoState(force: true)
+        refreshInboxReview(force: false)
+        refreshHyperD(force: false)
+        todoSyncTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.syncTodoState()
+            self.refreshInboxReview(force: false)
+            self.refreshHyperD(force: false)
+        }
+        if let todoSyncTimer {
+            RunLoop.main.add(todoSyncTimer, forMode: .common)
+        }
+    }
+
+    private func syncTodoState(force: Bool = false) {
+        let nextFingerprint = QuickEntryStore.todoStateFingerprint()
+        guard force || nextFingerprint != todoFingerprint else { return }
+        todoFingerprint = nextFingerprint
+        updateStatusTitle()
+        if todoPanel?.isVisible == true {
             todoPopoverController?.rebuild()
+        }
+    }
+
+    private func refreshInboxReview(force: Bool) {
+        guard !inboxReviewRefreshInFlight else { return }
+        guard force || QuickEntryStore.inboxReviewNeedsRefresh() else { return }
+
+        inboxReviewRefreshInFlight = true
+        QuickEntryStore.refreshInboxReview { [weak self] success in
+            guard let self else { return }
+            self.inboxReviewRefreshInFlight = false
+            if !success {
+                AppLog.write("Inbox review fell back to raw captures")
+            }
+            self.syncTodoState(force: true)
+            // The Top 3 should immediately stop considering interview notes
+            // once the conservative inbox review is available.
+            if success {
+                self.refreshHyperD(force: true)
+            }
+        }
+    }
+
+    private func refreshHyperD(force: Bool) {
+        guard !hyperDRefreshInFlight else { return }
+        guard force || QuickEntryStore.hyperDNeedsRefresh() else { return }
+
+        hyperDRefreshInFlight = true
+        todoPopoverController?.setHyperDRefreshState(true)
+        QuickEntryStore.refreshHyperDTodos { [weak self] success in
+            guard let self else { return }
+            self.hyperDRefreshInFlight = false
+            self.todoPopoverController?.setHyperDRefreshState(false)
+            if !success {
+                AppLog.write("HyperD refresh fell back to local priorities")
+            }
+            self.syncTodoState(force: true)
+        }
+    }
+
+    private func toggleTodoFromPopover(_ todo: TodoMenuEntry) {
+        do {
+            let entry = try QuickEntryStore.completeTodo(todo)
+            AppLog.write("completed todo id=\(todo.id)")
+            todoPopoverController?.recordCompletion(todo, entry: entry)
+            syncTodoState(force: true)
         } catch {
-            AppLog.write("failed toggling todo at lineIndex=\(lineIndex): \(error.localizedDescription)")
+            AppLog.write("failed completing todo id=\(todo.id): \(error.localizedDescription)")
+            NSSound.beep()
+        }
+    }
+
+    private func restoreLogbookEntry(_ entry: TodoLogbookEntry) {
+        do {
+            try QuickEntryStore.restoreLogbookEntry(entry)
+            AppLog.write("restored logbook entry id=\(entry.id)")
+            todoPopoverController?.removeSessionCompletion(entry)
+            syncTodoState(force: true)
+        } catch {
+            AppLog.write("failed restoring logbook entry id=\(entry.id): \(error.localizedDescription)")
             NSSound.beep()
         }
     }
@@ -346,96 +769,566 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panelController?.show()
     }
 
-    @objc private func revealTodoInbox() {
-        let url = QuickEntryStore.todoProcessingURL()
-        AppLog.write("revealTodoInbox url=\(url.path)")
+    private func revealTodoSource(_ source: TodoSource) {
+        let url = QuickEntryStore.url(for: source)
+        AppLog.write("revealTodoSource source=\(source.rawValue) url=\(url.path)")
         QuickEntryStore.ensureTodoProcessingExists()
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
-    @objc private func quit() {
-        AppLog.write("quit selected")
-        NSApp.terminate(nil)
-    }
+}
+
+private final class CASEMenuStackView: NSStackView {
+    override var isFlipped: Bool { true }
 }
 
 final class TodoPopoverController: NSViewController {
-    private let onQuickEntry: () -> Void
-    private let onReveal: () -> Void
-    private let onQuit: () -> Void
-    private let onToggle: (Int) -> Void
-    private let showsQuickEntryAction: Bool
-    private let stack = NSStackView()
+    private enum Screen {
+        case overview
+        case source(TodoSource)
+        case logbook
+    }
+
+    enum NavigationDirection {
+        case forward
+        case backward
+    }
+
+    private let onRevealSource: (TodoSource) -> Void
+    private let onToggle: (TodoMenuEntry) -> Void
+    private let onRestoreLogbook: (TodoLogbookEntry) -> Void
+    private let onRefreshHyperD: () -> Void
+    private let onPreferredSizeChange: (NSSize) -> Void
+    private let card = NSView()
+    private let headerContainer = NSView()
+    private let headerHeight: CGFloat = 64
+    private let scroll = NSScrollView()
+    private let stack = CASEMenuStackView()
+    private var topListFade: CASETextInputEdgeFade?
+    private var bottomListFade: CASETextInputEdgeFade?
+    private let listFadeHeight: CGFloat = 18
+    private var screen: Screen = .overview
+    private var isRefreshingHyperD = false
+    private var hyperDRefreshStartedAt: Date?
+    private var hyperDRefreshTimer: Timer?
+    private weak var hyperDLoadingView: CASEMenuLoadingView?
+    private var sessionCompleted: [SessionCompletedTodo] = []
+    private var logbookVisibleCount = 20
+    private var isLoadingMoreLogbook = false
+    private var scrollBoundsObserver: NSObjectProtocol?
+    private var headerConstraints: [NSLayoutConstraint] = []
 
     init(
-        onQuickEntry: @escaping () -> Void,
-        onReveal: @escaping () -> Void,
-        onQuit: @escaping () -> Void,
-        onToggle: @escaping (Int) -> Void,
-        showsQuickEntryAction: Bool
+        onRevealSource: @escaping (TodoSource) -> Void,
+        onToggle: @escaping (TodoMenuEntry) -> Void,
+        onRestoreLogbook: @escaping (TodoLogbookEntry) -> Void,
+        onRefreshHyperD: @escaping () -> Void,
+        onPreferredSizeChange: @escaping (NSSize) -> Void
     ) {
-        self.onQuickEntry = onQuickEntry
-        self.onReveal = onReveal
-        self.onQuit = onQuit
+        self.onRevealSource = onRevealSource
         self.onToggle = onToggle
-        self.showsQuickEntryAction = showsQuickEntryAction
+        self.onRestoreLogbook = onRestoreLogbook
+        self.onRefreshHyperD = onRefreshHyperD
+        self.onPreferredSizeChange = onPreferredSizeChange
         super.init(nibName: nil, bundle: nil)
     }
 
     required init?(coder: NSCoder) { nil }
 
+    deinit {
+        hyperDRefreshTimer?.invalidate()
+        if let scrollBoundsObserver {
+            NotificationCenter.default.removeObserver(scrollBoundsObserver)
+        }
+    }
+
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 344, height: 420))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 376, height: 460))
         view.wantsLayer = true
-        view.layer?.backgroundColor = qColor(0xfbfbfc).cgColor
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+
+        card.wantsLayer = true
+        card.layer?.backgroundColor = qColor(0xfbfbfc).cgColor
+        card.layer?.cornerRadius = 18
+        card.layer?.cornerCurve = .continuous
+        card.layer?.shadowColor = qColor(0x000000).cgColor
+        card.layer?.shadowOpacity = 0.16
+        card.layer?.shadowRadius = 14
+        card.layer?.shadowOffset = NSSize(width: 0, height: -4)
+        card.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(card)
+
+        headerContainer.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(headerContainer)
+
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.borderType = .noBorder
+        scroll.contentView.wantsLayer = true
+        scroll.contentView.postsBoundsChangedNotifications = true
+        scroll.documentView = stack
+        let topListFade = CASETextInputEdgeFade(edge: .top, backgroundColor: qColor(0xfbfbfc))
+        let bottomListFade = CASETextInputEdgeFade(edge: .bottom, backgroundColor: qColor(0xfbfbfc))
+        scroll.contentView.addSubview(topListFade, positioned: .above, relativeTo: stack)
+        scroll.contentView.addSubview(bottomListFade, positioned: .above, relativeTo: topListFade)
+        self.topListFade = topListFade
+        self.bottomListFade = bottomListFade
+        card.addSubview(scroll)
 
         stack.orientation = .vertical
         stack.alignment = .leading
+        stack.distribution = .fill
         stack.spacing = 0
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+        stack.edgeInsets = NSEdgeInsets(top: 10, left: 0, bottom: 10, right: 0)
+
+        scrollBoundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scroll.contentView,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateListFades()
+            self?.loadMoreLogbookIfNeeded()
+        }
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: view.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            card.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
+            card.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+            card.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
+            card.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -4),
+
+            headerContainer.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            headerContainer.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            headerContainer.topAnchor.constraint(equalTo: card.topAnchor),
+            headerContainer.heightAnchor.constraint(equalToConstant: headerHeight),
+
+            scroll.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: headerContainer.bottomAnchor),
+            scroll.bottomAnchor.constraint(equalTo: card.bottomAnchor),
         ])
 
         rebuild()
     }
 
-    func rebuild() {
+    func setHyperDRefreshState(_ refreshing: Bool) {
+        guard refreshing != isRefreshingHyperD else { return }
+        isRefreshingHyperD = refreshing
+
+        if refreshing {
+            hyperDRefreshStartedAt = Date()
+            rebuild()
+            startHyperDRefreshStatusUpdates()
+        } else {
+            stopHyperDRefreshStatusUpdates()
+            addHyperDRefreshCompletionTransition()
+            rebuild()
+        }
+    }
+
+    private func startHyperDRefreshStatusUpdates() {
+        hyperDRefreshTimer?.invalidate()
+        updateHyperDRefreshStatus()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            self?.updateHyperDRefreshStatus()
+        }
+        hyperDRefreshTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopHyperDRefreshStatusUpdates() {
+        hyperDRefreshTimer?.invalidate()
+        hyperDRefreshTimer = nil
+        hyperDRefreshStartedAt = nil
+        hyperDLoadingView = nil
+    }
+
+    private func updateHyperDRefreshStatus() {
+        guard let startedAt = hyperDRefreshStartedAt else { return }
+        let elapsed = Int(Date().timeIntervalSince(startedAt).rounded(.down))
+        let status: String
+        if elapsed <= 10 {
+            status = "Usually about 10 sec · \(elapsed) sec elapsed"
+        } else {
+            status = "Still ranking · \(elapsed) sec elapsed"
+        }
+        hyperDLoadingView?.setStatus(status)
+    }
+
+    private func addHyperDRefreshCompletionTransition() {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let layer = scroll.contentView.layer
+        else { return }
+        let transition = CATransition()
+        transition.type = .fade
+        transition.duration = 0.2
+        transition.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1)
+        layer.removeAnimation(forKey: "caseTodayRefreshCompletion")
+        layer.add(transition, forKey: "caseTodayRefreshCompletion")
+    }
+
+    func prepareForPresentation() {
+        guard let layer = card.layer else { return }
+        layer.removeAnimation(forKey: "caseTodoPresent")
+        layer.removeAnimation(forKey: "caseTodoDismiss")
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.transform = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            ? CATransform3DIdentity
+            : CATransform3DMakeScale(0.96, 0.96, 1)
+        CATransaction.commit()
+    }
+
+    func animatePresentation() {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let layer = card.layer
+        else { return }
+        let start = CATransform3DMakeScale(0.96, 0.96, 1)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.transform = CATransform3DIdentity
+        CATransaction.commit()
+
+        let animation = CABasicAnimation(keyPath: "transform")
+        animation.fromValue = NSValue(caTransform3D: start)
+        animation.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        animation.duration = 0.24
+        animation.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 1.08, 0.4, 1)
+        layer.add(animation, forKey: "caseTodoPresent")
+    }
+
+    func animateDismissal() {
+        guard let layer = card.layer else { return }
+        let target = CATransform3DMakeScale(0.97, 0.97, 1)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.transform = target
+        CATransaction.commit()
+
+        let animation = CABasicAnimation(keyPath: "transform")
+        animation.fromValue = NSValue(caTransform3D: CATransform3DIdentity)
+        animation.toValue = NSValue(caTransform3D: target)
+        animation.duration = 0.15
+        animation.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        layer.add(animation, forKey: "caseTodoDismiss")
+    }
+
+    func resetCardTransform() {
+        guard let layer = card.layer else { return }
+        layer.removeAnimation(forKey: "caseTodoPresent")
+        layer.removeAnimation(forKey: "caseTodoDismiss")
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.transform = CATransform3DIdentity
+        CATransaction.commit()
+    }
+
+    func refreshOverflowFades() {
+        updateListFades()
+    }
+
+    func recordCompletion(_ todo: TodoMenuEntry, entry: TodoLogbookEntry) {
+        let completed = TodoMenuEntry(
+            id: todo.id,
+            source: todo.source,
+            lineIndex: todo.lineIndex,
+            timestamp: todo.timestamp,
+            text: todo.text,
+            isDone: true
+        )
+        sessionCompleted.removeAll { $0.entry.id == entry.id || $0.todo.id == todo.id }
+        animateTodayCompletionUpdate()
+        sessionCompleted.insert(
+            SessionCompletedTodo(todo: completed, entry: entry, detail: "Recently completed"),
+            at: 0
+        )
+    }
+
+    func removeSessionCompletion(_ entry: TodoLogbookEntry) {
+        sessionCompleted.removeAll { $0.entry.id == entry.id }
+    }
+
+    func rebuild(navigation: NavigationDirection? = nil) {
         guard isViewLoaded else { return }
+        if let navigation {
+            addNavigationTransition(navigation)
+        }
         for subview in stack.arrangedSubviews {
             stack.removeArrangedSubview(subview)
             subview.removeFromSuperview()
         }
 
-        let openTodos = QuickEntryStore.todoItems().filter { !$0.isDone }
-        add(QuickEntryMenuHeaderView(openTodoCount: openTodos.count))
-        if showsQuickEntryAction {
-            add(QuickEntryMenuActionView(title: "Quick Entry", detail: hotKeyDescription, icon: "✎", onPress: onQuickEntry))
+        switch screen {
+        case .overview:
+            buildOverview()
+        case .source(let source):
+            buildSource(source)
+        case .logbook:
+            buildLogbook()
         }
-        add(QuickEntryMenuSectionView(title: openTodos.isEmpty ? "Today" : "Today"))
+        layoutList()
+    }
 
-        if openTodos.isEmpty {
-            add(QuickEntryMenuEmptyView())
+    private func setHeader(_ header: CASEMenuHeaderView) {
+        NSLayoutConstraint.deactivate(headerConstraints)
+        headerConstraints.removeAll()
+        for subview in headerContainer.subviews {
+            subview.removeFromSuperview()
+        }
+        header.translatesAutoresizingMaskIntoConstraints = false
+        headerContainer.addSubview(header)
+        headerConstraints = [
+            header.leadingAnchor.constraint(equalTo: headerContainer.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: headerContainer.trailingAnchor),
+            header.topAnchor.constraint(equalTo: headerContainer.topAnchor),
+            header.bottomAnchor.constraint(equalTo: headerContainer.bottomAnchor),
+        ]
+        NSLayoutConstraint.activate(headerConstraints)
+    }
+
+    private func buildOverview() {
+        let owing = QuickEntryStore.displayTodoItems(in: .owing).filter { !$0.isDone }
+        let inbox = QuickEntryStore.displayTodoItems(in: .inbox).filter { !$0.isDone }
+        let openCount = owing.count + inbox.count
+        let hyperD = QuickEntryStore.hyperDTodos()
+
+        setHeader(CASEMenuHeaderView(
+            title: "Today",
+            subtitle: openCount == 0 ? "Nothing open. Nice." : "\(openCount) active  •  \(QuickEntryStore.todayUpdatedText())",
+            // Do not leave a second refresh affordance active while the
+            // ranking request owns this state.
+            actionIcon: isRefreshingHyperD ? nil : "↻",
+            onAction: onRefreshHyperD
+        ))
+
+        if isRefreshingHyperD {
+            let loadingView = CASEMenuLoadingView()
+            hyperDLoadingView = loadingView
+            add(loadingView)
+            DispatchQueue.main.async { [weak self, weak loadingView] in
+                guard self?.hyperDLoadingView === loadingView else { return }
+                loadingView?.startAnimating()
+                self?.updateHyperDRefreshStatus()
+            }
+        } else if hyperD.isEmpty {
+            add(CASEMenuEmptyView(message: "No priority set yet. Refresh to rank today."))
         } else {
-            for todo in openTodos.prefix(12) {
-                add(QuickEntryTodoRowView(todo: todo, onToggle: onToggle))
-            }
-            if openTodos.count > 12 {
-                add(QuickEntryMenuSectionView(title: "\(openTodos.count - 12) more in todo-processing.md"))
+            for item in hyperD {
+                add(CASETodoRowView(todo: item.todo, detail: item.why, onToggle: onToggle))
             }
         }
 
-        add(QuickEntryMenuActionView(title: "Reveal Todo Inbox", detail: "Markdown", icon: "⌘", onPress: onReveal))
+        if !sessionCompleted.isEmpty {
+            add(CASEMenuSectionView(title: "Recently completed"))
+            for completed in sessionCompleted {
+                add(CASETodoRowView(
+                    todo: completed.todo,
+                    detail: completed.detail,
+                    isCompleted: true,
+                    onToggle: nil
+                ))
+            }
+        }
 
-        let quickEntryActionHeight = showsQuickEntryAction ? 34 : 0
-        let height = 48 + quickEntryActionHeight + 28 + (openTodos.isEmpty ? 42 : min(openTodos.count, 12) * 39) + (openTodos.count > 12 ? 28 : 0) + 34
-        preferredContentSize = NSSize(width: 344, height: min(max(height, 220), 620))
-        view.setFrameSize(preferredContentSize)
+        add(CASEMenuActionView(
+            title: "Owing",
+            detail: owing.isEmpty ? "Clear" : "\(owing.count) active",
+            icon: "",
+            onPress: { [weak self] in self?.show(.owing) }
+        ))
+        let heldNotes = QuickEntryStore.inboxNotesHeldCount()
+        let inboxDetail: String
+        if inbox.isEmpty {
+            inboxDetail = heldNotes > 0 ? "\(heldNotes) notes held" : "Clear"
+        } else {
+            inboxDetail = heldNotes > 0 ? "\(inbox.count) to do · \(heldNotes) notes held" : "\(inbox.count) to do"
+        }
+        add(CASEMenuActionView(
+            title: "Inbox",
+            detail: inboxDetail,
+            icon: "",
+            onPress: { [weak self] in self?.show(.inbox) }
+        ))
+        let logbookCount = QuickEntryStore.logbookEntries().count
+        add(CASEMenuActionView(
+            title: "Logbook",
+            detail: logbookCount == 0 ? "No completed to-dos" : "\(logbookCount) completed",
+            icon: "",
+            onPress: { [weak self] in self?.showLogbook() }
+        ))
+    }
+
+    private func buildSource(_ source: TodoSource) {
+        let todos = QuickEntryStore.displayTodoItems(in: source).filter { !$0.isDone }
+        let subtitle: String
+        if source == .inbox, QuickEntryStore.inboxNotesHeldCount() > 0 {
+            subtitle = "\(todos.count) actionable to-dos  •  \(QuickEntryStore.inboxNotesHeldCount()) notes held"
+        } else {
+            subtitle = todos.isEmpty ? "Nothing active" : "\(todos.count) active item\(todos.count == 1 ? "" : "s")"
+        }
+        setHeader(CASEMenuHeaderView(
+            title: source.title,
+            subtitle: subtitle,
+            onBack: { [weak self] in self?.showOverview() }
+        ))
+
+        if todos.isEmpty {
+            add(CASEMenuEmptyView(message: "Nothing waiting here."))
+        } else {
+            var previousContext: String?
+            for todo in todos {
+                if let context = todo.timestamp, context != previousContext {
+                    add(CASEMenuSectionView(title: context))
+                    previousContext = context
+                }
+                let detail = source == .inbox ? (todo.timestamp ?? "Inbox") : ""
+                add(CASETodoRowView(todo: todo, detail: detail, onToggle: onToggle))
+            }
+        }
+
+        add(CASEMenuActionView(
+            title: "Open \(source.title) in Finder",
+            detail: "Markdown",
+            icon: "↗",
+            onPress: { [weak self] in self?.onRevealSource(source) }
+        ))
+    }
+
+    private func buildLogbook() {
+        let allEntries = QuickEntryStore.logbookEntries()
+        let entries = Array(allEntries.prefix(logbookVisibleCount))
+        setHeader(CASEMenuHeaderView(
+            title: "Logbook",
+            subtitle: allEntries.isEmpty ? "No completed to-dos yet" : "Newest completed to-dos first",
+            onBack: { [weak self] in self?.showOverview() }
+        ))
+
+        if entries.isEmpty {
+            add(CASEMenuEmptyView(message: "Completed to-dos will stay here for rescue."))
+        } else {
+            var previousBucket: String?
+            for entry in entries {
+                let bucket = logbookBucket(for: entry)
+                if bucket != previousBucket {
+                    add(CASEMenuSectionView(title: bucket))
+                    previousBucket = bucket
+                }
+                add(CASELogbookRowView(
+                    entry: entry,
+                    completedAt: displayLogbookTimestamp(entry.completedAt),
+                    onRestore: { [weak self] in self?.onRestoreLogbook(entry) }
+                ))
+            }
+            if entries.count < allEntries.count {
+                add(CASEMenuEmptyView(message: "Keep scrolling to load older completed to-dos…"))
+            }
+        }
+    }
+
+    private func show(_ source: TodoSource) {
+        screen = .source(source)
+        rebuild(navigation: .forward)
+        scrollToTop()
+    }
+
+    private func showLogbook() {
+        logbookVisibleCount = 20
+        screen = .logbook
+        rebuild(navigation: .forward)
+        scrollToTop()
+    }
+
+    private func showOverview() {
+        screen = .overview
+        rebuild(navigation: .backward)
+        scrollToTop()
+    }
+
+    private func scrollToTop() {
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
+        updateListFades()
+    }
+
+    private func updateListFades() {
+        guard let documentView = scroll.documentView else { return }
+        scroll.layoutSubtreeIfNeeded()
+        documentView.layoutSubtreeIfNeeded()
+
+        let clipView = scroll.contentView
+        let visibleBounds = clipView.bounds
+        let documentBounds = documentView.convert(documentView.bounds, to: clipView)
+        let threshold: CGFloat = 0.5
+        let hasContentAbove = visibleBounds.minY > documentBounds.minY + threshold
+        let hasContentBelow = visibleBounds.maxY < documentBounds.maxY - threshold
+        let fadeHeight = min(listFadeHeight, visibleBounds.height)
+
+        topListFade?.frame = NSRect(
+            x: visibleBounds.minX,
+            y: visibleBounds.minY,
+            width: visibleBounds.width,
+            height: fadeHeight
+        )
+        bottomListFade?.frame = NSRect(
+            x: visibleBounds.minX,
+            y: visibleBounds.maxY - fadeHeight,
+            width: visibleBounds.width,
+            height: fadeHeight
+        )
+        topListFade?.alphaValue = hasContentAbove ? 1 : 0
+        bottomListFade?.alphaValue = hasContentBelow ? 1 : 0
+    }
+
+    private func loadMoreLogbookIfNeeded() {
+        guard case .logbook = screen,
+              !isLoadingMoreLogbook
+        else { return }
+
+        let allEntries = QuickEntryStore.logbookEntries()
+        guard logbookVisibleCount < allEntries.count else { return }
+        let visibleBottom = scroll.contentView.bounds.maxY
+        guard visibleBottom >= stack.frame.height - 100 else { return }
+
+        isLoadingMoreLogbook = true
+        let origin = scroll.contentView.bounds.origin
+        logbookVisibleCount += 20
+        rebuild()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.scroll.contentView.scroll(to: origin)
+            self.scroll.reflectScrolledClipView(self.scroll.contentView)
+            self.isLoadingMoreLogbook = false
+        }
+    }
+
+    private func animateTodayCompletionUpdate() {
+        guard case .overview = screen,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let layer = scroll.contentView.layer
+        else { return }
+
+        let transition = CATransition()
+        transition.type = .fade
+        transition.duration = 0.18
+        transition.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1)
+        layer.removeAnimation(forKey: "caseTodayCompletion")
+        layer.add(transition, forKey: "caseTodayCompletion")
+    }
+
+    private func addNavigationTransition(_ direction: NavigationDirection) {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let layer = scroll.contentView.layer
+        else { return }
+
+        let transition = CATransition()
+        transition.type = .push
+        transition.subtype = direction == .forward ? .fromRight : .fromLeft
+        transition.duration = 0.26
+        transition.timingFunction = CAMediaTimingFunction(controlPoints: 0.18, 0.9, 0.24, 1)
+        layer.removeAnimation(forKey: "caseTodoNavigation")
+        layer.add(transition, forKey: "caseTodoNavigation")
     }
 
     private func add(_ arranged: NSView) {
@@ -443,43 +1336,172 @@ final class TodoPopoverController: NSViewController {
         arranged.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         arranged.heightAnchor.constraint(equalToConstant: arranged.frame.height).isActive = true
     }
+
+    private func layoutList() {
+        let width: CGFloat = 368
+        let rowHeights = stack.arrangedSubviews.reduce(CGFloat.zero) { $0 + $1.frame.height }
+        let spacing = CGFloat(max(0, stack.arrangedSubviews.count - 1)) * stack.spacing
+        let verticalPadding = stack.edgeInsets.top + stack.edgeInsets.bottom
+        let contentHeight = max(1, rowHeights + spacing + verticalPadding)
+        let maximumListHeight: CGFloat = 620 - headerHeight - 8
+        let visibleHeight = min(max(contentHeight, 180), maximumListHeight)
+        stack.frame = NSRect(x: 0, y: 0, width: width, height: contentHeight)
+        scroll.hasVerticalScroller = contentHeight > visibleHeight
+        let nextPreferredSize = NSSize(width: width + 8, height: visibleHeight + headerHeight + 8)
+        let preferredSizeChanged = abs(preferredContentSize.width - nextPreferredSize.width) > 0.5 || abs(preferredContentSize.height - nextPreferredSize.height) > 0.5
+        preferredContentSize = nextPreferredSize
+        if view.window == nil {
+            view.setFrameSize(nextPreferredSize)
+        } else if preferredSizeChanged {
+            onPreferredSizeChange(nextPreferredSize)
+        }
+        stack.layoutSubtreeIfNeeded()
+        DispatchQueue.main.async { [weak self] in
+            self?.updateListFades()
+        }
+    }
+
+    private func displayLogbookTimestamp(_ raw: String) -> String {
+        guard let date = ISO8601DateFormatter().date(from: raw) else { return "recently" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MMM d, h:mma"
+        return formatter.string(from: date).lowercased()
+    }
+
+    private func logbookBucket(for entry: TodoLogbookEntry) -> String {
+        guard let date = ISO8601DateFormatter().date(from: entry.completedAt) else { return "Earlier" }
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) { return "Today" }
+        if calendar.isDateInYesterday(date) { return "Yesterday" }
+        if let weekStart = calendar.dateInterval(of: .weekOfYear, for: Date())?.start, date >= weekStart {
+            return "This week" }
+        if calendar.isDate(date, equalTo: Date(), toGranularity: .month) { return "This month" }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MMMM yyyy"
+        return formatter.string(from: date)
+    }
 }
 
-final class QuickEntryMenuHeaderView: NSView {
-    init(openTodoCount: Int) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 344, height: 48))
+final class CASEMenuHeaderView: NSView {
+    init(
+        title: String,
+        subtitle: String,
+        actionIcon: String? = nil,
+        actionEnabled: Bool = true,
+        onAction: (() -> Void)? = nil,
+        onBack: (() -> Void)? = nil
+    ) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: 64))
         wantsLayer = true
         layer?.backgroundColor = qColor(0xfbfbfc).cgColor
 
-        let title = NSTextField(labelWithString: "Quick Entry")
-        title.font = .systemFont(ofSize: 14, weight: .semibold)
-        title.textColor = qColor(0x1f2329)
-        title.translatesAutoresizingMaskIntoConstraints = false
+        let titleView = NSTextField(labelWithString: title)
+        titleView.font = .systemFont(ofSize: 14, weight: .semibold)
+        titleView.textColor = qColor(0x1f2329)
+        titleView.translatesAutoresizingMaskIntoConstraints = false
 
-        let subtitleText = openTodoCount == 0 ? "No open TODOs" : "\(openTodoCount) open TODO\(openTodoCount == 1 ? "" : "s")"
-        let subtitle = NSTextField(labelWithString: subtitleText)
-        subtitle.font = .systemFont(ofSize: 11, weight: .regular)
-        subtitle.textColor = qColor(0x8d949e)
-        subtitle.translatesAutoresizingMaskIntoConstraints = false
+        let subtitleView = NSTextField(labelWithString: subtitle)
+        subtitleView.font = .systemFont(ofSize: 11, weight: .regular)
+        subtitleView.textColor = qColor(0x8d949e)
+        subtitleView.lineBreakMode = .byTruncatingTail
+        subtitleView.translatesAutoresizingMaskIntoConstraints = false
 
-        addSubview(title)
-        addSubview(subtitle)
+        addSubview(titleView)
+        addSubview(subtitleView)
 
-        NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+        var constraints = [
+            titleView.topAnchor.constraint(equalTo: topAnchor, constant: 16),
+            subtitleView.leadingAnchor.constraint(equalTo: titleView.leadingAnchor),
+            subtitleView.topAnchor.constraint(equalTo: titleView.bottomAnchor, constant: 1),
+        ]
 
-            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
-        ])
+        if let onBack {
+            let back = CASEHeaderActionView(icon: "‹", accessibilityLabel: "Back to Today", isEnabled: true, onPress: onBack)
+            back.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(back)
+            constraints += [
+                back.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+                // Align the back affordance with the title, not the two-line
+                // header block; centering it in the whole header read low.
+                back.centerYAnchor.constraint(equalTo: titleView.centerYAnchor),
+                back.widthAnchor.constraint(equalToConstant: 30),
+                back.heightAnchor.constraint(equalToConstant: 30),
+                titleView.leadingAnchor.constraint(equalTo: back.trailingAnchor, constant: 8),
+            ]
+        } else {
+            constraints.append(titleView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20))
+        }
+
+        if let actionIcon, let onAction {
+            let action = CASEHeaderActionView(icon: actionIcon, accessibilityLabel: "Refresh today’s list", isEnabled: actionEnabled, onPress: onAction)
+            action.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(action)
+            constraints += [
+                action.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
+                action.centerYAnchor.constraint(equalTo: centerYAnchor),
+                action.widthAnchor.constraint(equalToConstant: 30),
+                action.heightAnchor.constraint(equalToConstant: 30),
+                titleView.trailingAnchor.constraint(lessThanOrEqualTo: action.leadingAnchor, constant: -12),
+                subtitleView.trailingAnchor.constraint(lessThanOrEqualTo: action.leadingAnchor, constant: -12),
+            ]
+        } else {
+            constraints += [
+                titleView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
+                subtitleView.trailingAnchor.constraint(equalTo: titleView.trailingAnchor),
+            ]
+        }
+        NSLayoutConstraint.activate(constraints)
     }
 
     required init?(coder: NSCoder) { nil }
 }
 
-final class QuickEntryMenuSectionView: NSView {
+final class CASEHeaderActionView: NSView {
+    private let onPress: () -> Void
+    private let isActionEnabled: Bool
+
+    init(icon: String, accessibilityLabel: String, isEnabled: Bool, onPress: @escaping () -> Void) {
+        self.onPress = onPress
+        self.isActionEnabled = isEnabled
+        super.init(frame: NSRect(x: 0, y: 0, width: 30, height: 30))
+        wantsLayer = true
+        layer?.backgroundColor = qColor(0xf0f2f5).cgColor
+        layer?.cornerRadius = 9
+        layer?.cornerCurve = .continuous
+        alphaValue = isEnabled ? 1 : 0.5
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(accessibilityLabel)
+
+        let label = NSTextField(labelWithString: icon)
+        label.font = .systemFont(ofSize: 17, weight: .medium)
+        label.textColor = qColor(0x3f4650)
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isActionEnabled else { return }
+        layer?.backgroundColor = qColor(0xe3e7ec).cgColor
+        onPress()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            self?.layer?.backgroundColor = qColor(0xf0f2f5).cgColor
+        }
+    }
+}
+
+final class CASEMenuSectionView: NSView {
     init(title: String) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 344, height: 28))
+        super.init(frame: NSRect(x: 0, y: 0, width: 368, height: 36))
         wantsLayer = true
         layer?.backgroundColor = qColor(0xfbfbfc).cgColor
 
@@ -490,20 +1512,107 @@ final class QuickEntryMenuSectionView: NSView {
         addSubview(label)
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 4),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 3),
         ])
     }
 
     required init?(coder: NSCoder) { nil }
 }
 
-final class QuickEntryMenuEmptyView: NSView {
+final class CASEMenuLoadingView: NSView {
+    private let card = NSView()
+    private let spinner = CASESpinnerView(frame: NSRect(x: 0, y: 0, width: 14, height: 14))
+    private let titleLabel = NSTextField(labelWithString: "Ranking today’s work")
+    private let statusLabel = CASEShimmerLabel(text: "Usually about 10 sec · 0 sec elapsed")
+
     init() {
-        super.init(frame: NSRect(x: 0, y: 0, width: 344, height: 42))
+        super.init(frame: NSRect(x: 0, y: 0, width: 368, height: 58))
         wantsLayer = true
         layer?.backgroundColor = qColor(0xfbfbfc).cgColor
 
-        let label = NSTextField(labelWithString: "Nothing waiting. Nice.")
+        card.wantsLayer = true
+        card.layer?.backgroundColor = qColor(0xf2f4f7).cgColor
+        card.layer?.cornerRadius = 10
+        card.layer?.cornerCurve = .continuous
+        card.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(card)
+
+        spinner.setStrokeColor(qColor(0x5c6673))
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(spinner)
+
+        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        titleLabel.textColor = qColor(0x30353d)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(titleLabel)
+
+        statusLabel.font = .systemFont(ofSize: 10, weight: .regular)
+        statusLabel.textColor = qColor(0x7d8590)
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(statusLabel)
+
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            card.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            // Use the exact same 3 pt vertical inset as the overview rows.
+            // Keep the content position fixed while the card gains that pixel.
+            card.topAnchor.constraint(equalTo: topAnchor, constant: 3),
+            card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
+            // Match the text rail used by Owing, Inbox, and Logbook. The
+            // spinner is a status affordance, so it belongs at the far edge.
+            titleLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
+            titleLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: spinner.leadingAnchor, constant: -10),
+            statusLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            statusLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 1),
+            statusLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            spinner.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -13),
+            spinner.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            spinner.widthAnchor.constraint(equalToConstant: 14),
+            spinner.heightAnchor.constraint(equalToConstant: 14),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func startAnimating() {
+        spinner.startAnimating()
+        spinner.alphaValue = 1
+        statusLabel.startShimmer(text: statusLabel.stringValue)
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let layer
+        else { return }
+        let entrance = CAAnimationGroup()
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0
+        fade.toValue = 1
+        let lift = CABasicAnimation(keyPath: "transform.translation.y")
+        lift.fromValue = 6
+        lift.toValue = 0
+        entrance.animations = [fade, lift]
+        entrance.duration = 0.22
+        entrance.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1)
+        layer.add(entrance, forKey: "caseTodayLoadingEntrance")
+    }
+
+    func setStatus(_ status: String) {
+        statusLabel.updateShimmerText(status)
+    }
+
+    deinit {
+        spinner.stopAnimating()
+        statusLabel.stopShimmer()
+    }
+}
+
+final class CASEMenuEmptyView: NSView {
+    init(message: String = "Nothing waiting. Nice.") {
+        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: 42))
+        wantsLayer = true
+        layer?.backgroundColor = qColor(0xfbfbfc).cgColor
+
+        let label = NSTextField(labelWithString: message)
         label.font = .systemFont(ofSize: 12, weight: .regular)
         label.textColor = qColor(0x8d949e)
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -518,67 +1627,190 @@ final class QuickEntryMenuEmptyView: NSView {
     required init?(coder: NSCoder) { nil }
 }
 
-final class QuickEntryMenuActionView: NSView {
+final class CASEMenuActionView: NSView {
     private let onPress: () -> Void
+    private let isActionEnabled: Bool
+    private let card = NSView()
 
-    init(title: String, detail: String, icon: String, onPress: @escaping () -> Void) {
+    init(
+        title: String,
+        detail: String,
+        icon: String,
+        isEnabled: Bool = true,
+        onPress: @escaping () -> Void
+    ) {
         self.onPress = onPress
-        super.init(frame: NSRect(x: 0, y: 0, width: 344, height: 34))
+        self.isActionEnabled = isEnabled
+        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: 46))
         wantsLayer = true
         layer?.backgroundColor = qColor(0xfbfbfc).cgColor
+        alphaValue = isEnabled ? 1 : 0.5
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(title)
 
-        let iconView = NSTextField(labelWithString: icon)
-        iconView.font = .systemFont(ofSize: 12, weight: .medium)
-        iconView.alignment = .center
-        iconView.textColor = qColor(0x8d949e)
-        iconView.translatesAutoresizingMaskIntoConstraints = false
+        card.wantsLayer = true
+        card.layer?.backgroundColor = qColor(0xf2f4f7).cgColor
+        card.layer?.cornerRadius = 10
+        card.layer?.cornerCurve = .continuous
+        card.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(card)
 
         let titleView = NSTextField(labelWithString: title)
-        titleView.font = .systemFont(ofSize: 12, weight: .medium)
-        titleView.textColor = qColor(0x333840)
+        titleView.font = .systemFont(ofSize: 12, weight: .semibold)
+        titleView.textColor = qColor(0x30353d)
         titleView.translatesAutoresizingMaskIntoConstraints = false
 
         let detailView = NSTextField(labelWithString: detail)
         detailView.font = .systemFont(ofSize: 11, weight: .medium)
-        detailView.textColor = qColor(0x8d949e)
+        detailView.textColor = qColor(0x7d8590)
         detailView.alignment = .right
+        detailView.lineBreakMode = .byTruncatingHead
         detailView.translatesAutoresizingMaskIntoConstraints = false
 
-        addSubview(iconView)
-        addSubview(titleView)
-        addSubview(detailView)
+        card.addSubview(titleView)
+        card.addSubview(detailView)
 
-        NSLayoutConstraint.activate([
-            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
-            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 14),
-            iconView.heightAnchor.constraint(equalToConstant: 14),
-
-            titleView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 43),
-            titleView.centerYAnchor.constraint(equalTo: centerYAnchor),
-
-            detailView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
-            detailView.centerYAnchor.constraint(equalTo: centerYAnchor),
+        var constraints = [
+            card.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            card.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            card.topAnchor.constraint(equalTo: topAnchor, constant: 3),
+            card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
+            detailView.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            detailView.centerYAnchor.constraint(equalTo: card.centerYAnchor),
             detailView.leadingAnchor.constraint(greaterThanOrEqualTo: titleView.trailingAnchor, constant: 12),
+        ]
+
+        if icon.isEmpty {
+            constraints.append(titleView.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13))
+        } else {
+            let iconView = NSTextField(labelWithString: icon)
+            iconView.font = .systemFont(ofSize: 13, weight: .medium)
+            iconView.alignment = .center
+            iconView.textColor = qColor(0x747d88)
+            iconView.translatesAutoresizingMaskIntoConstraints = false
+            card.addSubview(iconView)
+            constraints += [
+                iconView.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+                iconView.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+                iconView.widthAnchor.constraint(equalToConstant: 14),
+                titleView.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            ]
+        }
+        constraints.append(titleView.centerYAnchor.constraint(equalTo: card.centerYAnchor))
+        NSLayoutConstraint.activate(constraints)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isActionEnabled else { return }
+        animatePress()
+        onPress()
+    }
+
+    private func animatePress() {
+        card.layer?.backgroundColor = qColor(0xe6eaef).cgColor
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            self?.card.layer?.backgroundColor = qColor(0xf2f4f7).cgColor
+        }
+    }
+}
+
+final class CASELogbookRowView: NSView {
+    private let onRestore: () -> Void
+    private let card = NSView()
+
+    init(entry: TodoLogbookEntry, completedAt: String, onRestore: @escaping () -> Void) {
+        self.onRestore = onRestore
+        let presentation = todoPresentation(entry.text)
+        let titleFont = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let title = markdownLabel(presentation.title, font: titleFont, color: qColor(0x30353d))
+        let titleWidth: CGFloat = 238
+        let titleHeight = ceil(title.boundingRect(
+            with: NSSize(width: titleWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height)
+        let rowHeight = max(CGFloat(62), 14 + titleHeight + 3 + 13 + 14)
+        super.init(frame: NSRect(x: 0, y: 0, width: 368, height: rowHeight))
+        wantsLayer = true
+        layer?.backgroundColor = qColor(0xfbfbfc).cgColor
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("Restore \(presentation.title)")
+
+        card.wantsLayer = true
+        card.layer?.backgroundColor = qColor(0xf2f4f7).cgColor
+        card.layer?.cornerRadius = 10
+        card.layer?.cornerCurve = .continuous
+        card.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(card)
+
+        let titleView = NSTextField(labelWithString: "")
+        titleView.attributedStringValue = title
+        titleView.maximumNumberOfLines = 0
+        titleView.lineBreakMode = .byWordWrapping
+        titleView.cell?.wraps = true
+        titleView.cell?.isScrollable = false
+        titleView.translatesAutoresizingMaskIntoConstraints = false
+
+        let detailView = NSTextField(labelWithString: conciseMetadata("\(entry.source.title) · \(completedAt)", category: presentation.category))
+        detailView.font = .systemFont(ofSize: 10, weight: .regular)
+        detailView.textColor = qColor(0x858d98)
+        detailView.lineBreakMode = .byTruncatingTail
+        detailView.translatesAutoresizingMaskIntoConstraints = false
+
+        let restorePill = NSView()
+        restorePill.wantsLayer = true
+        restorePill.layer?.backgroundColor = qColor(0xe2e6eb).cgColor
+        restorePill.layer?.cornerRadius = 7
+        restorePill.layer?.cornerCurve = .continuous
+        restorePill.translatesAutoresizingMaskIntoConstraints = false
+
+        let restoreLabel = NSTextField(labelWithString: "Restore")
+        restoreLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        restoreLabel.textColor = qColor(0x4a525c)
+        restoreLabel.translatesAutoresizingMaskIntoConstraints = false
+        restorePill.addSubview(restoreLabel)
+
+        card.addSubview(titleView)
+        card.addSubview(detailView)
+        card.addSubview(restorePill)
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            card.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            card.topAnchor.constraint(equalTo: topAnchor, constant: 3),
+            card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
+
+            titleView.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
+            titleView.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            titleView.trailingAnchor.constraint(equalTo: restorePill.leadingAnchor, constant: -8),
+            titleView.heightAnchor.constraint(equalToConstant: titleHeight),
+
+            detailView.leadingAnchor.constraint(equalTo: titleView.leadingAnchor),
+            detailView.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -13),
+            detailView.topAnchor.constraint(equalTo: titleView.bottomAnchor, constant: 3),
+            detailView.heightAnchor.constraint(equalToConstant: 13),
+
+            restorePill.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
+            restorePill.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            restorePill.widthAnchor.constraint(equalToConstant: 52),
+            restorePill.heightAnchor.constraint(equalToConstant: 22),
+            restoreLabel.centerXAnchor.constraint(equalTo: restorePill.centerXAnchor),
+            restoreLabel.centerYAnchor.constraint(equalTo: restorePill.centerYAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { nil }
 
     override func mouseDown(with event: NSEvent) {
-        animatePress()
-        onPress()
-    }
-
-    private func animatePress() {
-        layer?.backgroundColor = qColor(0xf1f3f6).cgColor
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            self?.layer?.backgroundColor = qColor(0xfbfbfc).cgColor
+        card.layer?.backgroundColor = qColor(0xe6eaef).cgColor
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) { [weak self] in
+            guard let self else { return }
+            self.onRestore()
         }
     }
 }
 
-final class QuickEntryCheckboxView: NSView {
+final class CASECheckboxView: NSView {
     var checked = false {
         didSet { needsDisplay = true }
     }
@@ -593,9 +1825,9 @@ final class QuickEntryCheckboxView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let rect = bounds.insetBy(dx: 0.75, dy: 0.75)
         let path = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
-        (checked ? qColor(0x2d7a4a) : qColor(0xfbfbfc)).setFill()
+        (checked ? qColor(0x1f2329) : qColor(0xfbfbfc)).setFill()
         path.fill()
-        (checked ? qColor(0x2d7a4a) : qColor(0xcfd5df)).setStroke()
+        (checked ? qColor(0x1f2329) : qColor(0xcfd5df)).setStroke()
         path.lineWidth = 1.2
         path.stroke()
 
@@ -613,98 +1845,152 @@ final class QuickEntryCheckboxView: NSView {
     }
 }
 
-final class QuickEntryTodoRowView: NSView {
-    private let todo: TodoMenuEntry
-    private let onToggle: (Int) -> Void
-    private let checkbox = QuickEntryCheckboxView()
+final class CASELinkButton: NSButton {
+    private let onOpen: () -> Void
 
-    init(todo: TodoMenuEntry, onToggle: @escaping (Int) -> Void) {
+    init(title: String, onOpen: @escaping () -> Void) {
+        self.onOpen = onOpen
+        super.init(frame: .zero)
+        self.title = title
+        isBordered = false
+        bezelStyle = .inline
+        font = .systemFont(ofSize: 10, weight: .medium)
+        contentTintColor = .linkColor
+        target = self
+        action = #selector(open)
+        setAccessibilityRole(.link)
+        setAccessibilityLabel(title)
+        translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    @objc private func open() {
+        onOpen()
+    }
+}
+
+final class CASETodoRowView: NSView {
+    private let todo: TodoMenuEntry
+    private let onToggle: ((TodoMenuEntry) -> Void)?
+    private let isCompleted: Bool
+    private let checkbox = CASECheckboxView()
+    private let restingColor: NSColor
+
+    init(
+        todo: TodoMenuEntry,
+        detail: String,
+        isCompleted: Bool = false,
+        onToggle: ((TodoMenuEntry) -> Void)?
+    ) {
         self.todo = todo
         self.onToggle = onToggle
-        super.init(frame: NSRect(x: 0, y: 0, width: 344, height: 39))
-        wantsLayer = true
-        layer?.backgroundColor = qColor(0xfbfbfc).cgColor
+        self.isCompleted = isCompleted
+        restingColor = qColor(0xfbfbfc)
 
-        let title = NSTextField(labelWithString: clean(todo.text, limit: 58))
-        title.font = .systemFont(ofSize: 12, weight: .regular)
-        title.textColor = qColor(0x20242a)
-        title.lineBreakMode = .byTruncatingTail
+        let presentation = todoPresentation(todo.text)
+        let titleAndURL = firstURLAndTitle(presentation.title)
+        let noteText = conciseMetadata(detail, category: presentation.category)
+        let hasDetail = !noteText.isEmpty
+        let titleFont = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let titleColor = isCompleted ? qColor(0x858d98) : qColor(0x20242a)
+        let styledTitle = NSMutableAttributedString(attributedString: markdownLabel(Self.clean(titleAndURL.title), font: titleFont, color: titleColor))
+        if isCompleted {
+            styledTitle.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: NSRange(location: 0, length: styledTitle.length))
+        }
+        let titleWidth: CGFloat = titleAndURL.url == nil ? 300 : 238
+        let measuredTitleHeight = ceil(styledTitle.boundingRect(
+            with: NSSize(width: titleWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height)
+        let rowHeight = max(hasDetail ? CGFloat(58) : CGFloat(42), 13 + measuredTitleHeight + (hasDetail ? 15 : 0) + 12)
+
+        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: rowHeight))
+        wantsLayer = true
+        layer?.backgroundColor = restingColor.cgColor
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("\(presentation.title). \(noteText). \(isCompleted ? "Completed" : "Mark complete")")
+
+        let title = NSTextField(labelWithString: "")
+        title.attributedStringValue = styledTitle
+        title.maximumNumberOfLines = 0
+        title.lineBreakMode = .byWordWrapping
+        title.cell?.wraps = true
+        title.cell?.isScrollable = false
         title.translatesAutoresizingMaskIntoConstraints = false
 
-        let timeText = todo.timestamp.map { Self.displayTimestamp($0) } ?? "Inbox"
-        let note = NSTextField(labelWithString: timeText)
+        let note = NSTextField(labelWithString: Self.clean(noteText))
         note.font = .systemFont(ofSize: 10, weight: .regular)
-        note.textColor = qColor(0xa0a7b0)
+        note.textColor = isCompleted ? qColor(0x9ca3ac) : qColor(0xa0a7b0)
+        note.lineBreakMode = .byTruncatingTail
         note.translatesAutoresizingMaskIntoConstraints = false
+        note.isHidden = !hasDetail
 
-        let separator = NSView()
-        separator.wantsLayer = true
-        separator.layer?.backgroundColor = qColor(0xe8ebef).cgColor
-        separator.translatesAutoresizingMaskIntoConstraints = false
-
+        checkbox.checked = isCompleted
         addSubview(checkbox)
         addSubview(title)
         addSubview(note)
-        addSubview(separator)
 
-        NSLayoutConstraint.activate([
+        let linkButton: CASELinkButton? = titleAndURL.url.map { url in
+            let button = CASELinkButton(title: "Open ↗") {
+                NSWorkspace.shared.open(url)
+            }
+            addSubview(button)
+            return button
+        }
+
+        var constraints = [
             checkbox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 21),
-            checkbox.centerYAnchor.constraint(equalTo: centerYAnchor),
+            checkbox.topAnchor.constraint(equalTo: topAnchor, constant: 14),
             checkbox.widthAnchor.constraint(equalToConstant: 14),
             checkbox.heightAnchor.constraint(equalToConstant: 14),
 
             title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 43),
-            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 5),
-
-            note.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            note.topAnchor.constraint(equalTo: title.bottomAnchor, constant: -1),
-
-            separator.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
-            separator.bottomAnchor.constraint(equalTo: bottomAnchor),
-            separator.heightAnchor.constraint(equalToConstant: 1),
-        ])
+            title.trailingAnchor.constraint(equalTo: linkButton?.leadingAnchor ?? trailingAnchor, constant: linkButton == nil ? -18 : -8),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            title.heightAnchor.constraint(equalToConstant: measuredTitleHeight),
+        ]
+        if let linkButton {
+            constraints += [
+                linkButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+                linkButton.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+                linkButton.widthAnchor.constraint(equalToConstant: 48),
+                linkButton.heightAnchor.constraint(equalToConstant: 20),
+            ]
+        }
+        if hasDetail {
+            constraints += [
+                note.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+                note.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+                note.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
+                note.heightAnchor.constraint(equalToConstant: 13),
+            ]
+        }
+        NSLayoutConstraint.activate(constraints)
     }
 
     required init?(coder: NSCoder) { nil }
 
     override func mouseDown(with event: NSEvent) {
-        layer?.backgroundColor = qColor(0xf1f3f6).cgColor
+        guard !isCompleted, let onToggle else { return }
+        layer?.backgroundColor = qColor(0xe9edf1).cgColor
         checkbox.checked = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) { [weak self] in
             guard let self else { return }
-            self.onToggle(self.todo.lineIndex)
+            onToggle(self.todo)
         }
     }
 
-    private static func displayTimestamp(_ raw: String) -> String {
-        let parser = DateFormatter()
-        parser.calendar = Calendar(identifier: .gregorian)
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.dateFormat = "yyyy-MM-dd HH:mm"
-
-        guard let date = parser.date(from: raw) else { return raw }
-
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "EEEE, MMMM d h:mma"
-        return formatter.string(from: date).replacingOccurrences(of: "AM", with: "am").replacingOccurrences(of: "PM", with: "pm")
+    override func mouseUp(with event: NSEvent) {
+        layer?.backgroundColor = restingColor.cgColor
     }
 
-    private func clean(_ input: String, limit: Int) -> String {
-        var text = input.replacingOccurrences(of: "\n", with: " ")
-        while text.contains("  ") { text = text.replacingOccurrences(of: "  ", with: " ") }
-        if text.count > limit {
-            let end = text.index(text.startIndex, offsetBy: limit)
-            text = String(text[..<end]) + "…"
-        }
-        return text
+    private static func clean(_ input: String) -> String {
+        input.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
     }
 }
 
-final class QuickEntrySpinnerView: NSView {
+final class CASESpinnerView: NSView {
     private let arcLayer = CAShapeLayer()
 
     override init(frame frameRect: NSRect) {
@@ -728,10 +2014,14 @@ final class QuickEntrySpinnerView: NSView {
         updatePath()
     }
 
+    func setStrokeColor(_ color: NSColor) {
+        arcLayer.strokeColor = color.cgColor
+    }
+
     func startAnimating() {
         isHidden = false
         updatePath()
-        guard arcLayer.animation(forKey: "quickEntrySpin") == nil else { return }
+        guard arcLayer.animation(forKey: "caseSpin") == nil else { return }
 
         let animation = CABasicAnimation(keyPath: "transform.rotation.z")
         animation.fromValue = 0
@@ -739,11 +2029,11 @@ final class QuickEntrySpinnerView: NSView {
         animation.duration = 1.2
         animation.repeatCount = .infinity
         animation.timingFunction = CAMediaTimingFunction(name: .linear)
-        arcLayer.add(animation, forKey: "quickEntrySpin")
+        arcLayer.add(animation, forKey: "caseSpin")
     }
 
     func stopAnimating() {
-        arcLayer.removeAnimation(forKey: "quickEntrySpin")
+        arcLayer.removeAnimation(forKey: "caseSpin")
         isHidden = true
         alphaValue = 0
     }
@@ -766,7 +2056,7 @@ final class QuickEntrySpinnerView: NSView {
     }
 }
 
-final class QuickEntryPassiveButtonTitleLabel: NSTextField {
+final class CASEPassiveButtonTitleLabel: NSTextField {
     init(text: String = "") {
         super.init(frame: .zero)
         stringValue = text
@@ -787,8 +2077,8 @@ final class QuickEntryPassiveButtonTitleLabel: NSTextField {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
-final class QuickEntryRollingActionButton: NSButton {
-    private let titleLabel = QuickEntryPassiveButtonTitleLabel()
+final class CASERollingActionButton: NSButton {
+    private let titleLabel = CASEPassiveButtonTitleLabel()
     private var currentActionTitle = ""
 
     override init(frame frameRect: NSRect) {
@@ -831,7 +2121,7 @@ final class QuickEntryRollingActionButton: NSButton {
 
         addModeTextRoll(
             to: titleLayer,
-            key: "quickEntryActionTitleRoll",
+            key: "caseActionTitleRoll",
             subtype: direction.buttonTitleSubtype
         )
         titleLabel.stringValue = title
@@ -850,13 +2140,13 @@ final class QuickEntryRollingActionButton: NSButton {
     }
 
     private func cancelTitleTransition() {
-        titleLabel.layer?.removeAnimation(forKey: "quickEntryActionTitleRoll")
+        titleLabel.layer?.removeAnimation(forKey: "caseActionTitleRoll")
         titleLabel.alphaValue = currentActionTitle.isEmpty ? 0 : 1
         titleLabel.frame = titleFrame
     }
 }
 
-final class QuickEntryShimmerLabel: NSTextField {
+final class CASEShimmerLabel: NSTextField {
     private var gradientLayer: CAGradientLayer?
     private var textMaskLayer: CATextLayer?
     private var restingTextColor: NSColor?
@@ -926,11 +2216,11 @@ final class QuickEntryShimmerLabel: NSTextField {
         animation.duration = 1.5
         animation.repeatCount = .infinity
         animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        gradient.add(animation, forKey: "quickEntryTextShimmer")
+        gradient.add(animation, forKey: "caseTextShimmer")
     }
 
     func stopShimmer(restoreTextColor: Bool = true) {
-        gradientLayer?.removeAnimation(forKey: "quickEntryTextShimmer")
+        gradientLayer?.removeAnimation(forKey: "caseTextShimmer")
         gradientLayer?.removeFromSuperlayer()
         gradientLayer = nil
         textMaskLayer = nil
@@ -964,7 +2254,7 @@ final class QuickEntryShimmerLabel: NSTextField {
 
         addModeTextRoll(
             to: layer,
-            key: "quickEntryStatusTextRoll",
+            key: "caseStatusTextRoll",
             subtype: direction.fieldSubtype
         )
         stringValue = text
@@ -976,7 +2266,7 @@ final class QuickEntryShimmerLabel: NSTextField {
     }
 }
 
-final class QuickEntryModeTabs: NSView {
+final class CASEModeTabs: NSView {
     enum Selection {
         case todo
         case writing
@@ -1001,8 +2291,8 @@ final class QuickEntryModeTabs: NSView {
         activePill.cornerRadius = 12
         activePill.cornerCurve = .continuous
 
-        configure(todoButton, label: "Todo mode", identifier: "QuickEntryModeTodo")
-        configure(writingButton, label: "Writing mode", identifier: "QuickEntryModeWriting")
+        configure(todoButton, label: "Todo mode", identifier: "CASEQuickEntryModeTodo")
+        configure(writingButton, label: "Writing mode", identifier: "CASEQuickEntryModeWriting")
         todoButton.target = self
         todoButton.action = #selector(selectTodo)
         writingButton.target = self
@@ -1035,8 +2325,8 @@ final class QuickEntryModeTabs: NSView {
         guard selection != self.selection else { return }
         layoutSubtreeIfNeeded()
         let currentX = activePill.presentation()?.position.x ?? activePill.position.x
-        activePill.removeAnimation(forKey: "quickEntryModeTabSlide")
-        activePill.removeAnimation(forKey: "quickEntryModeTabImpact")
+        activePill.removeAnimation(forKey: "caseModeTabSlide")
+        activePill.removeAnimation(forKey: "caseModeTabImpact")
         self.selection = selection
         let targetFrame = indicatorFrame(for: selection)
 
@@ -1061,7 +2351,7 @@ final class QuickEntryModeTabs: NSView {
             slide.toValue = targetX
             slide.duration = 0.18
             slide.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            activePill.add(slide, forKey: "quickEntryModeTabSlide")
+            activePill.add(slide, forKey: "caseModeTabSlide")
             return
         }
 
@@ -1082,7 +2372,7 @@ final class QuickEntryModeTabs: NSView {
             CAMediaTimingFunction(name: .easeOut),
             CAMediaTimingFunction(name: .easeInEaseOut),
         ]
-        activePill.add(slide, forKey: "quickEntryModeTabSlide")
+        activePill.add(slide, forKey: "caseModeTabSlide")
 
         let impact = CAKeyframeAnimation(keyPath: "transform.scale.x")
         impact.values = [1, 1, 0.985, 1.004, 1]
@@ -1094,7 +2384,7 @@ final class QuickEntryModeTabs: NSView {
             CAMediaTimingFunction(name: .easeInEaseOut),
             CAMediaTimingFunction(name: .easeOut),
         ]
-        activePill.add(impact, forKey: "quickEntryModeTabImpact")
+        activePill.add(impact, forKey: "caseModeTabImpact")
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -1141,19 +2431,21 @@ final class QuickEntryModeTabs: NSView {
     }
 }
 
-final class QuickEntryTextInputEdgeFade: NSView {
+final class CASETextInputEdgeFade: NSView {
     enum Edge {
         case top
         case bottom
     }
 
     private let edge: Edge
+    private let backgroundColor: NSColor
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
 
-    init(edge: Edge) {
+    init(edge: Edge, backgroundColor: NSColor = qColor(0xffffff)) {
         self.edge = edge
+        self.backgroundColor = backgroundColor
         super.init(frame: .zero)
         alphaValue = 0
     }
@@ -1161,13 +2453,14 @@ final class QuickEntryTextInputEdgeFade: NSView {
     required init?(coder: NSCoder) { nil }
 
     override func draw(_ dirtyRect: NSRect) {
-        let opaque = qColor(0xffffff, alpha: 0.92)
+        let opaque = backgroundColor.withAlphaComponent(0.96)
+        let transparent = backgroundColor.withAlphaComponent(0)
         let gradient: NSGradient
         switch edge {
         case .top:
-            gradient = NSGradient(starting: opaque, ending: qColor(0xffffff, alpha: 0))!
+            gradient = NSGradient(starting: opaque, ending: transparent)!
         case .bottom:
-            gradient = NSGradient(starting: qColor(0xffffff, alpha: 0), ending: opaque)!
+            gradient = NSGradient(starting: transparent, ending: opaque)!
         }
         gradient.draw(
             from: NSPoint(x: bounds.midX, y: bounds.minY),
@@ -1184,6 +2477,11 @@ final class QuickEntryPanel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
+final class TodoMenuPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 final class QuickEntryPanelController: NSObject, NSWindowDelegate {
     private enum EntryMode {
         case todo
@@ -1192,19 +2490,19 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
 
     private let window: NSPanel
     private let textView: QuickEntryTextView
-    private let statusLabel: QuickEntryShimmerLabel
+    private let statusLabel: CASEShimmerLabel
     private var card: NSView?
     private var textScroll: NSScrollView?
-    private var topTextInputFade: QuickEntryTextInputEdgeFade?
-    private var bottomTextInputFade: QuickEntryTextInputEdgeFade?
+    private var topTextInputFade: CASETextInputEdgeFade?
+    private var bottomTextInputFade: CASETextInputEdgeFade?
     private let textInputFadeHeight: CGFloat = 14
     private var textScrollBoundsObserver: NSObjectProtocol?
     private var isTextInputFadeUpdateScheduled = false
-    private var saveButton: QuickEntryRollingActionButton?
+    private var saveButton: CASERollingActionButton?
     private var copyButton: NSButton?
-    private var modeTabs: QuickEntryModeTabs?
+    private var modeTabs: CASEModeTabs?
     private var cancelButton: NSButton?
-    private var polishSpinner: QuickEntrySpinnerView?
+    private var polishSpinner: CASESpinnerView?
     private var mode: EntryMode = .todo
     private var targetFrame: NSRect = .zero
     private var isPolishing = false
@@ -1238,7 +2536,7 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
         window.alphaValue = 0
 
         textView = QuickEntryTextView(frame: .zero)
-        statusLabel = QuickEntryShimmerLabel(text: "⌘↩ save · esc cancel")
+        statusLabel = CASEShimmerLabel(text: "⌘↩ save · esc cancel")
         super.init()
 
         textView.onSave = { [weak self] in self?.primaryAction() }
@@ -1324,7 +2622,7 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
         header.alignment = .centerY
         header.spacing = 8
 
-        let modeTabs = QuickEntryModeTabs(frame: .zero)
+        let modeTabs = CASEModeTabs(frame: .zero)
         modeTabs.translatesAutoresizingMaskIntoConstraints = false
         modeTabs.onSelection = { [weak self] selection in
             self?.selectMode(selection)
@@ -1356,8 +2654,8 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
         scroll.contentView.postsBoundsChangedNotifications = true
         textScroll = scroll
 
-        let topTextInputFade = QuickEntryTextInputEdgeFade(edge: .top)
-        let bottomTextInputFade = QuickEntryTextInputEdgeFade(edge: .bottom)
+        let topTextInputFade = CASETextInputEdgeFade(edge: .top)
+        let bottomTextInputFade = CASETextInputEdgeFade(edge: .bottom)
         // Put the overlays inside the clip view, above the document view. Their
         // frames are updated with the clip bounds so they stay pinned to the
         // visible edges while the text scrolls.
@@ -1386,7 +2684,7 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
         textView.isAutomaticTextCompletionEnabled = true
         textView.setAccessibilityRole(.textArea)
         textView.setAccessibilityLabel("Quick Entry")
-        textView.setAccessibilityIdentifier("QuickEntryInput")
+        textView.setAccessibilityIdentifier("CASEQuickEntryInput")
         textView.placeholder = "Drop the thing before it evaporates…"
         textView.onContentChange = { [weak self] in
             self?.scheduleTextInputFadeUpdate()
@@ -1407,7 +2705,7 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
         copyButton.isEnabled = false
         self.copyButton = copyButton
 
-        let saveButton = QuickEntryRollingActionButton(frame: .zero)
+        let saveButton = CASERollingActionButton(frame: .zero)
         saveButton.target = self
         saveButton.action = #selector(primaryAction)
         configureButton(saveButton, background: qColor(0x0e1014), text: .white)
@@ -1416,7 +2714,7 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
         saveButton.keyEquivalentModifierMask = [.command]
         self.saveButton = saveButton
 
-        let polishSpinner = QuickEntrySpinnerView(frame: .zero)
+        let polishSpinner = CASESpinnerView(frame: .zero)
         polishSpinner.translatesAutoresizingMaskIntoConstraints = false
         saveButton.addSubview(polishSpinner)
         self.polishSpinner = polishSpinner
@@ -1588,12 +2886,12 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
         CATransaction.commit()
     }
 
-    private func selectModeFromShortcut(_ selection: QuickEntryModeTabs.Selection) {
+    private func selectModeFromShortcut(_ selection: CASEModeTabs.Selection) {
         guard !isPolishing else { return }
         selectMode(selection)
     }
 
-    private func selectMode(_ selection: QuickEntryModeTabs.Selection) {
+    private func selectMode(_ selection: CASEModeTabs.Selection) {
         let selectedMode: EntryMode = selection == .todo ? .todo : .writing
         guard selectedMode != mode else { return }
         mode = selectedMode
@@ -1612,13 +2910,13 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
         switch mode {
         case .todo:
             actionTitle = "Save"
-            statusText = "Timestamped. Saved to your local inbox."
+            statusText = "Timestamped. Calendar-aware. Routed later."
             placeholder = "Drop the thing before it evaporates…"
             rollDirection = .down
         case .writing:
             actionTitle = "Polish"
             statusText = "Brain dump. Polish for Slack."
-            placeholder = "Brain dump or dictate a rough draft…"
+            placeholder = "Brain dump with MacWhisper…"
             rollDirection = .up
         }
 
@@ -1750,7 +3048,7 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
             press.toValue = 1.0
             press.duration = 0.18
             press.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            saveButton.layer?.add(press, forKey: "quickEntryPolishPress")
+            saveButton.layer?.add(press, forKey: "casePolishPress")
 
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.16
@@ -1787,7 +3085,7 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
             transition.type = .fade
             transition.duration = 0.24
             transition.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
-            self.textView.layer?.add(transition, forKey: "quickEntryPolishedTextFade")
+            self.textView.layer?.add(transition, forKey: "casePolishedTextFade")
 
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.30
@@ -1845,28 +3143,15 @@ final class QuickEntryPanelController: NSObject, NSWindowDelegate {
         modeTabs?.setEnabled(false)
         setPolishLoading(true, estimatedDuration: estimatedPolishDuration(for: raw))
 
+        let process = Process()
         guard let scriptURL = Bundle.main.url(forResource: "polish-writing", withExtension: "sh") else {
-            AppLog.write("polish launch failed: bundled polish-writing.sh is missing")
-            isPolishing = false
-            setPolishLoading(false)
-            textView.isEditable = true
-            saveButton?.isEnabled = true
-            modeTabs?.setEnabled(true)
-            applyMode()
             NSSound.beep()
-            statusLabel.stringValue = "could not find polish script"
+            statusLabel.stringValue = "polish helper missing"
             return
         }
-
-        let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [scriptURL.path]
-        var environment = ProcessInfo.processInfo.environment
-        environment["HOME"] = FileManager.default.homeDirectoryForCurrentUser.path
-        environment["QUICK_ENTRY_APP_RESOURCES"] = Bundle.main.resourceURL?.path
-        let inheritedPath = environment["PATH"] ?? ""
-        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\(inheritedPath)"
-        process.environment = environment
+        process.environment = ProcessInfo.processInfo.environment
 
         let input = Pipe()
         let output = Pipe()
@@ -2159,16 +3444,50 @@ final class QuickEntryTextView: NSTextView {
 }
 
 enum QuickEntryStore {
-    static func todoProcessingURL() -> URL {
-        if let configuredPath = ProcessInfo.processInfo.environment["QUICK_ENTRY_TODO_FILE"],
-           !configuredPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return URL(fileURLWithPath: (configuredPath as NSString).expandingTildeInPath)
+    private static let caseRootURL: URL = {
+        if let override = ProcessInfo.processInfo.environment["QUICK_ENTRY_ROOT"], !override.isEmpty {
+            return URL(fileURLWithPath: override)
         }
-
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home
+        if let configuredTodoFile = ProcessInfo.processInfo.environment["QUICK_ENTRY_TODO_FILE"], !configuredTodoFile.isEmpty {
+            return URL(fileURLWithPath: configuredTodoFile).deletingLastPathComponent()
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(QuickEntryConfiguration.defaultInboxDirectory)
-            .appendingPathComponent(QuickEntryConfiguration.defaultInboxFileName)
+    }()
+    private static let hyperDRefreshInterval: TimeInterval = 30 * 60
+    private static let inboxReviewRefreshInterval: TimeInterval = 15 * 60
+
+    static func todoProcessingURL() -> URL {
+        if let configured = ProcessInfo.processInfo.environment["QUICK_ENTRY_TODO_FILE"], !configured.isEmpty {
+            return URL(fileURLWithPath: configured)
+        }
+        return caseRootURL.appendingPathComponent(QuickEntryConfiguration.defaultInboxFileName)
+    }
+
+    static func stateOfTheUnionURL() -> URL {
+        if let configured = ProcessInfo.processInfo.environment["QUICK_ENTRY_STATE_FILE"], !configured.isEmpty {
+            return URL(fileURLWithPath: configured)
+        }
+        return caseRootURL.appendingPathComponent("state-of-the-union.md")
+    }
+
+    static func hyperDCacheURL() -> URL {
+        caseRootURL.appendingPathComponent(".cache/quick-entry-hyperd.json")
+    }
+
+    static func logbookURL() -> URL {
+        caseRootURL.appendingPathComponent(".cache/quick-entry-logbook.json")
+    }
+
+    static func inboxReviewCacheURL() -> URL {
+        caseRootURL.appendingPathComponent(".cache/quick-entry-inbox-review.json")
+    }
+
+    static func url(for source: TodoSource) -> URL {
+        switch source {
+        case .owing: return stateOfTheUnionURL()
+        case .inbox: return todoProcessingURL()
+        }
     }
 
     static func ensureTodoProcessingExists() {
@@ -2177,69 +3496,294 @@ enum QuickEntryStore {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: url.path) {
             AppLog.write("creating todo-processing inbox at \(url.path)")
-            let initial = "# Todo Processing\n\nQuick Entry captures land here. Use **Ctrl+Space**, write a note, then press **Cmd+Return** to save it.\n\n## Inbox\n\n<!-- New captures land below. Process, move, or delete them however you prefer. -->\n\n## Processed\n\n<!-- Move completed or processed items here if useful. -->\n"
+            let initial = "# To-do Inbox\n\nFast capture inbox. Use **Quick Entry** (`Ctrl+Space`, then `Cmd+Return`) from anywhere on the Mac to append here.\n\n## Inbox\n\n<!-- Add raw captures below. -->\n\n## Processed\n\n<!-- Move or summarize processed batches here with date/time when useful. -->\n"
             try? initial.write(to: url, atomically: true, encoding: .utf8)
         }
     }
 
     static func todoItems() -> [TodoMenuEntry] {
-        ensureTodoProcessingExists()
-        let url = todoProcessingURL()
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return [] }
-        let lines = content.components(separatedBy: .newlines)
-        var items: [TodoMenuEntry] = []
-        var inInbox = false
-        var currentTimestamp: String?
+        TodoSource.allCases.flatMap { todoItems(in: $0) }
+    }
 
-        for (index, line) in lines.enumerated() {
-            if line.trimmingCharacters(in: .whitespaces) == "## Inbox" {
-                inInbox = true
-                continue
-            }
-            if line.trimmingCharacters(in: .whitespaces) == "## Processed" {
-                inInbox = false
-                continue
-            }
-            guard inInbox else { continue }
+    static func actionableTodoItems() -> [TodoMenuEntry] {
+        displayTodoItems(in: .owing) + displayTodoItems(in: .inbox)
+    }
 
-            if line.hasPrefix("### ") {
-                currentTimestamp = String(line.dropFirst(4)).trimmingCharacters(in: .whitespaces)
-                continue
-            }
-
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("- [ ] ") || trimmed.hasPrefix("- [x] ") || trimmed.hasPrefix("- [X] ") {
-                let isDone = trimmed.hasPrefix("- [x] ") || trimmed.hasPrefix("- [X] ")
-                let text = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-                items.append(TodoMenuEntry(lineIndex: index, timestamp: currentTimestamp, text: text, isDone: isDone))
-            }
+    static func displayTodoItems(in source: TodoSource) -> [TodoMenuEntry] {
+        let items = todoItems(in: source)
+        guard source == .inbox,
+              let review = inboxReviewCache(),
+              review.mode == "agent"
+        else {
+            return items
         }
 
-        return items
+        let reviewByID = Dictionary(uniqueKeysWithValues: review.items.map { ($0.id, $0) })
+        return items.compactMap { item in
+            guard !item.isDone else { return item }
+            guard let reviewed = reviewByID[item.id] else { return item }
+            guard reviewed.classification == "todo" else { return nil }
+            return TodoMenuEntry(
+                id: item.id,
+                source: item.source,
+                lineIndex: item.lineIndex,
+                timestamp: item.timestamp,
+                text: reviewed.text,
+                isDone: item.isDone
+            )
+        }
+    }
+
+    static func todoItems(in source: TodoSource) -> [TodoMenuEntry] {
+        if source == .inbox {
+            ensureTodoProcessingExists()
+        }
+        let url = url(for: source)
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        let lines = content.components(separatedBy: .newlines)
+
+        switch source {
+        case .inbox:
+            return parseInbox(lines)
+        case .owing:
+            return parseOwing(lines)
+        }
     }
 
     static func openTodoCount() -> Int {
-        todoItems().filter { !$0.isDone }.count
+        actionableTodoItems().filter { !$0.isDone }.count
     }
 
-    static func toggleTodo(atLineIndex lineIndex: Int) throws {
-        ensureTodoProcessingExists()
-        let url = todoProcessingURL()
-        let content = try String(contentsOf: url, encoding: .utf8)
-        var lines = content.components(separatedBy: .newlines)
-        guard lines.indices.contains(lineIndex) else { return }
+    static func inboxNotesHeldCount() -> Int {
+        guard let review = inboxReviewCache(), review.mode == "agent" else { return 0 }
+        return review.nonActionableCount
+    }
 
-        let line = lines[lineIndex]
-        if line.contains("- [ ] ") {
-            lines[lineIndex] = line.replacingOccurrences(of: "- [ ] ", with: "- [x] ", options: [], range: line.range(of: "- [ ] "))
-        } else if line.contains("- [x] ") {
-            lines[lineIndex] = line.replacingOccurrences(of: "- [x] ", with: "- [ ] ", options: [], range: line.range(of: "- [x] "))
-        } else if line.contains("- [X] ") {
-            lines[lineIndex] = line.replacingOccurrences(of: "- [X] ", with: "- [ ] ", options: [], range: line.range(of: "- [X] "))
+    static func todoStateFingerprint() -> String {
+        let urls = [todoProcessingURL(), stateOfTheUnionURL(), hyperDCacheURL(), logbookURL(), inboxReviewCacheURL()]
+        return urls.map { url in
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let date = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+            return "\(url.lastPathComponent):\(date):\(size)"
+        }.joined(separator: "|")
+    }
+
+    static func hyperDNeedsRefresh() -> Bool {
+        let url = hyperDCacheURL()
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let modified = attributes[.modificationDate] as? Date
+        else {
+            return true
+        }
+        return Date().timeIntervalSince(modified) >= hyperDRefreshInterval
+    }
+
+    static func inboxReviewNeedsRefresh() -> Bool {
+        let cacheURL = inboxReviewCacheURL()
+        guard let cacheAttributes = try? FileManager.default.attributesOfItem(atPath: cacheURL.path),
+              let cacheModified = cacheAttributes[.modificationDate] as? Date
+        else {
+            return true
+        }
+        let inboxModified = ((try? FileManager.default.attributesOfItem(atPath: todoProcessingURL().path))?[.modificationDate] as? Date) ?? .distantPast
+        return inboxModified > cacheModified || Date().timeIntervalSince(cacheModified) >= inboxReviewRefreshInterval
+    }
+
+    static func hyperDTodos() -> [HyperDTodoEntry] {
+        let activeTodos = actionableTodoItems().filter { !$0.isDone }
+        let todosByID = Dictionary(uniqueKeysWithValues: activeTodos.map { ($0.id, $0) })
+
+        guard let cache = hyperDCache() else {
+            return activeTodos.prefix(3).map { todo in
+                HyperDTodoEntry(
+                    todo: todo,
+                    why: todo.source == .owing ? "Active Owing item" : "Unprocessed inbox capture"
+                )
+            }
         }
 
+        let matched = cache.items.compactMap { recommendation -> HyperDTodoEntry? in
+            guard let todo = todosByID[recommendation.id] else { return nil }
+            return HyperDTodoEntry(todo: todo, why: recommendation.why)
+        }
+        if !matched.isEmpty {
+            return matched
+        }
+        return activeTodos.prefix(3).map { todo in
+            HyperDTodoEntry(
+                todo: todo,
+                why: todo.source == .owing ? "Active Owing item" : "Unprocessed inbox capture"
+            )
+        }
+    }
+
+    static func hyperDStatusText() -> String {
+        guard let cache = hyperDCache() else { return "No radar yet" }
+        let parser = ISO8601DateFormatter()
+        guard let date = parser.date(from: cache.generatedAt) else {
+            return cache.mode == "agent" ? "Agent-ranked" : "Local fallback"
+        }
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        let age: String
+        switch seconds {
+        case ..<60: age = "now"
+        case ..<3_600: age = "\(max(1, seconds / 60))m ago"
+        default: age = "\(seconds / 3_600)h ago"
+        }
+        return cache.mode == "agent" ? "Radar · \(age)" : "Fallback · \(age)"
+    }
+
+    static func todayUpdatedText() -> String {
+        guard let cache = hyperDCache(), let date = ISO8601DateFormatter().date(from: cache.generatedAt) else {
+            return "Updated recently"
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        if Calendar.current.isDateInToday(date) {
+            formatter.dateFormat = "h:mma"
+        } else {
+            formatter.dateFormat = "MMM d, h:mma"
+        }
+        return "Updated \(formatter.string(from: date).lowercased())"
+    }
+
+    static func refreshInboxReview(completion: @escaping (Bool) -> Void) {
+        guard let scriptURL = inboxReviewScriptURL() else {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["python3", scriptURL.path]
+            var environment = ProcessInfo.processInfo.environment
+            environment["QUICK_ENTRY_ROOT"] = caseRootURL.path
+            environment["PATH"] = "/Users/jasonhuff/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            process.environment = environment
+            let error = Pipe()
+            process.standardError = error
+            process.standardOutput = Pipe()
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let succeeded = process.terminationStatus == 0
+                if !succeeded {
+                    let errorText = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "unknown error"
+                    AppLog.write("Inbox review failed: \(errorText.prefix(300))")
+                }
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .caseInboxReviewChanged, object: nil)
+                    completion(succeeded)
+                }
+            } catch {
+                AppLog.write("Could not launch inbox review: \(error.localizedDescription)")
+                DispatchQueue.main.async { completion(false) }
+            }
+        }
+    }
+
+    static func refreshHyperDTodos(completion: @escaping (Bool) -> Void) {
+        guard let scriptURL = hyperDRefreshScriptURL() else {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["python3", scriptURL.path]
+            var environment = ProcessInfo.processInfo.environment
+            environment["QUICK_ENTRY_ROOT"] = caseRootURL.path
+            environment["PATH"] = "/Users/jasonhuff/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            process.environment = environment
+            let error = Pipe()
+            process.standardError = error
+            process.standardOutput = Pipe()
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let succeeded = process.terminationStatus == 0
+                if !succeeded {
+                    let errorText = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "unknown error"
+                    AppLog.write("HyperD refresh failed: \(errorText.prefix(300))")
+                }
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .caseHyperDTodosChanged, object: nil)
+                    completion(succeeded)
+                }
+            } catch {
+                AppLog.write("Could not launch HyperD refresh: \(error.localizedDescription)")
+                DispatchQueue.main.async { completion(false) }
+            }
+        }
+    }
+
+    static func completeTodo(_ todo: TodoMenuEntry) throws -> TodoLogbookEntry {
+        if todo.source == .inbox {
+            ensureTodoProcessingExists()
+        }
+        let current = todoItems(in: todo.source)
+        guard let currentTodo = current.first(where: { $0.id == todo.id }), !currentTodo.isDone else {
+            throw todoChangedError()
+        }
+
+        let url = url(for: todo.source)
+        let content = try String(contentsOf: url, encoding: .utf8)
+        var lines = content.components(separatedBy: .newlines)
+        guard lines.indices.contains(currentTodo.lineIndex) else { throw todoChangedError() }
+        guard let range = lines[currentTodo.lineIndex].range(of: "- [ ] ") else {
+            throw todoChangedError()
+        }
+        lines[currentTodo.lineIndex].replaceSubrange(range, with: "- [x] ")
         try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
-        NotificationCenter.default.post(name: .quickEntryTodosChanged, object: nil)
+
+        let entry = TodoLogbookEntry(
+            id: UUID().uuidString,
+            completedAt: isoTimestamp(),
+            todoID: currentTodo.id,
+            source: currentTodo.source,
+            text: todo.text,
+            timestamp: currentTodo.timestamp,
+            restoredAt: nil
+        )
+        try appendLogbook(entry)
+        return entry
+    }
+
+    static func logbookEntries() -> [TodoLogbookEntry] {
+        loadLogbookEntries()
+            .filter { $0.restoredAt == nil }
+            .sorted { $0.completedAt > $1.completedAt }
+    }
+
+    static func restoreLogbookEntry(_ entry: TodoLogbookEntry) throws {
+        let current = todoItems(in: entry.source)
+        guard let todo = current.first(where: { $0.id == entry.todoID }) ?? current.first(where: { $0.text == entry.text && $0.isDone }) else {
+            throw todoChangedError()
+        }
+
+        let url = url(for: entry.source)
+        let content = try String(contentsOf: url, encoding: .utf8)
+        var lines = content.components(separatedBy: .newlines)
+        guard lines.indices.contains(todo.lineIndex) else { throw todoChangedError() }
+        if let range = lines[todo.lineIndex].range(of: "- [x] ") {
+            lines[todo.lineIndex].replaceSubrange(range, with: "- [ ] ")
+        } else if let range = lines[todo.lineIndex].range(of: "- [X] ") {
+            lines[todo.lineIndex].replaceSubrange(range, with: "- [ ] ")
+        } else {
+            throw todoChangedError()
+        }
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+
+        var entries = loadLogbookEntries()
+        if let index = entries.firstIndex(where: { $0.id == entry.id }) {
+            entries[index].restoredAt = isoTimestamp()
+            try writeLogbook(entries)
+        }
     }
 
     static func append(_ note: String) throws {
@@ -2281,7 +3825,162 @@ enum QuickEntryStore {
         }
 
         try content.write(to: url, atomically: true, encoding: .utf8)
-        NotificationCenter.default.post(name: .quickEntryTodosChanged, object: nil)
+        NotificationCenter.default.post(name: .caseTodosChanged, object: nil)
         AppLog.write("append wrote inbox successfully")
+    }
+
+    private static func parseInbox(_ lines: [String]) -> [TodoMenuEntry] {
+        var items: [TodoMenuEntry] = []
+        var inInbox = false
+        var currentTimestamp: String?
+
+        for (index, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == "## Inbox" {
+                inInbox = true
+                continue
+            }
+            if trimmed == "## Processed" {
+                break
+            }
+            guard inInbox else { continue }
+
+            if line.hasPrefix("### ") {
+                currentTimestamp = String(line.dropFirst(4)).trimmingCharacters(in: .whitespaces)
+                continue
+            }
+            if let item = todoEntry(from: line, index: index, source: .inbox, timestamp: currentTimestamp) {
+                items.append(item)
+            }
+        }
+        return items
+    }
+
+    private static func parseOwing(_ lines: [String]) -> [TodoMenuEntry] {
+        var items: [TodoMenuEntry] = []
+        var inOwing = false
+        var currentHeading: String?
+
+        for (index, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == "## Owing" {
+                inOwing = true
+                continue
+            }
+            guard inOwing else { continue }
+            if trimmed.hasPrefix("## ") {
+                break
+            }
+            if trimmed.hasPrefix("### ") {
+                currentHeading = String(trimmed.dropFirst(4)).trimmingCharacters(in: .whitespaces)
+                continue
+            }
+            if trimmed.hasPrefix("- **"), trimmed.hasSuffix("**"), !trimmed.contains(":**") {
+                currentHeading = String(trimmed.dropFirst(4).dropLast(2)).trimmingCharacters(in: .whitespaces)
+                continue
+            }
+            if line.hasPrefix("- [") {
+                currentHeading = nil
+            }
+            if let item = todoEntry(from: line, index: index, source: .owing, timestamp: currentHeading) {
+                items.append(item)
+            }
+        }
+        return items
+    }
+
+    private static func todoEntry(
+        from line: String,
+        index: Int,
+        source: TodoSource,
+        timestamp: String?
+    ) -> TodoMenuEntry? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let isOpen = trimmed.hasPrefix("- [ ] ")
+        let isDone = trimmed.hasPrefix("- [x] ") || trimmed.hasPrefix("- [X] ")
+        guard isOpen || isDone else { return nil }
+        let text = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return nil }
+        return TodoMenuEntry(
+            id: stableID(source: source, text: text),
+            source: source,
+            lineIndex: index,
+            timestamp: timestamp,
+            text: text,
+            isDone: isDone
+        )
+    }
+
+    private static func stableID(source: TodoSource, text: String) -> String {
+        let normalized = text.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+        let digest = SHA256.hash(data: Data("\(source.rawValue)|\(normalized)".utf8))
+        let hash = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "\(source.rawValue):\(hash)"
+    }
+
+    private static func hyperDCache() -> HyperDTodoCache? {
+        let url = hyperDCacheURL()
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(HyperDTodoCache.self, from: data)
+    }
+
+    private static func inboxReviewCache() -> InboxReviewCache? {
+        let url = inboxReviewCacheURL()
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(InboxReviewCache.self, from: data)
+    }
+
+    private static func inboxReviewScriptURL() -> URL? {
+        if let bundled = Bundle.main.url(forResource: "preprocess-inbox", withExtension: "py") {
+            return bundled
+        }
+        let development = caseRootURL.appendingPathComponent("tools/QuickEntry/preprocess-inbox.py")
+        return FileManager.default.fileExists(atPath: development.path) ? development : nil
+    }
+
+    private static func hyperDRefreshScriptURL() -> URL? {
+        if let bundled = Bundle.main.url(forResource: "refresh-hyperd-todos", withExtension: "py") {
+            return bundled
+        }
+        let development = caseRootURL.appendingPathComponent("tools/QuickEntry/refresh-hyperd-todos.py")
+        return FileManager.default.fileExists(atPath: development.path) ? development : nil
+    }
+
+    private static func loadLogbookEntries() -> [TodoLogbookEntry] {
+        guard let data = try? Data(contentsOf: logbookURL()) else { return [] }
+        return (try? JSONDecoder().decode([TodoLogbookEntry].self, from: data)) ?? []
+    }
+
+    private static func appendLogbook(_ entry: TodoLogbookEntry) throws {
+        var entries = loadLogbookEntries()
+        entries.append(entry)
+        // Keep a generous local audit trail without allowing an accidental click
+        // history to turn into a second task database.
+        if entries.count > 1_000 {
+            entries.removeFirst(entries.count - 1_000)
+        }
+        try writeLogbook(entries)
+    }
+
+    private static func writeLogbook(_ entries: [TodoLogbookEntry]) throws {
+        let url = logbookURL()
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(entries).write(to: url, options: .atomic)
+    }
+
+    private static func isoTimestamp() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime]
+        return formatter.string(from: Date())
+    }
+
+    private static func todoChangedError() -> NSError {
+        NSError(
+            domain: "QuickEntry",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "That to-do changed. Reopen the list and try again."]
+        )
     }
 }

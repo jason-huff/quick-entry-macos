@@ -12,7 +12,8 @@ Press **Ctrl+Space** from anywhere to open a compact capture window. Save a time
 ## What it does
 
 - Global `Ctrl+Space` capture window.
-- Local Markdown todo inbox with a menu-bar view of open items.
+- A polished circular menu-bar to-do viewer: **Today**, **Owing**, **Inbox**, and a restorable completion **Logbook**.
+- Local Markdown sources only; checking an item off updates the source file.
 - **To do** mode: writes timestamped checkboxes to a local file.
 - **Writing** mode: sends a draft through Pi for a concise, paste-ready rewrite.
 - Quick `Copy` action after a successful polish.
@@ -74,10 +75,16 @@ The configured path is stored in the generated launch agent. Re-run the command 
 
 ### Optional To-dos companion
 
-Quick Entry can run its to-do surface as a separate, menu-bar-only companion app. The companion has no global capture hotkey; it reads and checks off the same local Markdown file as Quick Entry.
+Quick Entry can run its full to-do viewer as a separate, menu-bar-only companion app. The companion has no global capture hotkey; it reads and checks off the same local Markdown sources as Quick Entry. In companion mode, it shows a circular menu-bar control and the main capture app does not show a second to-do icon.
+
+The viewer reads `## Inbox` from the configured to-do file. It can also read `## Owing` from a separate state file (default: `state-of-the-union.md` next to the inbox). When that file does not exist, the Owing list is simply empty.
 
 ```bash
 QUICK_ENTRY_TODO_COMPANION=1 ./build.sh
+
+# Optional: point the Owing list at your own Markdown checklist.
+QUICK_ENTRY_STATE_FILE="$HOME/Documents/state-of-the-union.md" \
+  QUICK_ENTRY_TODO_COMPANION=1 ./build.sh
 ```
 
 This installs **Quick Entry To-dos.app** and starts it at login. In companion mode, the main Quick Entry app keeps `Ctrl+Space` capture and yields its embedded to-do menu to the companion, so there is only one checklist icon.
@@ -112,7 +119,7 @@ The build script writes those settings into the launch agent and also includes c
 
 ### Data note
 
-To-do mode is local-only. Writing mode sends the entered draft to whichever model provider your Pi installation uses. Read and edit [`polish-writing.sh`](polish-writing.sh) before using it with sensitive text.
+To-do mode is local-only. The bundled Today ordering and Inbox display are deterministic local fallbacks; the app does not send to-do content to an AI service. Writing mode sends the entered draft to whichever model provider your Pi installation uses. Read and edit [`polish-writing.sh`](polish-writing.sh) before using it with sensitive text.
 
 ## Rebuild / uninstall
 
