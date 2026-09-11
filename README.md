@@ -1,5 +1,7 @@
 # Quick Entry for macOS
 
+> **Credit:** This mini-app began with [Jon Rundle](https://github.com/jonrundle)’s work and design. Jason Huff is iterating on it for a lightweight macOS capture workflow.
+
 A lightweight macOS menu-bar helper for catching a thought before it disappears.
 
 Press **Ctrl+Space** from anywhere to open a compact capture window. Save a timestamped todo to local Markdown, or switch to **Writing** mode to turn a rough draft into clear, direct copy with [Pi](https://pi.dev) and the bundled `write-without-bullshit` skill.
