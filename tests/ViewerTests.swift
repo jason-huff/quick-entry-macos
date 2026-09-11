@@ -15,6 +15,13 @@ struct ViewerTests {
         precondition(parsed.title == "Read the brief.")
         precondition(parsed.url?.absoluteString == "https://example.com/brief")
         precondition(firstURLAndTitle("No link here").title == "No link here")
+        let sourced = firstURLAndTitle("Review the brief. Source: https://example.com/brief")
+        precondition(sourced.title == "Review the brief.")
+        let markdown = firstURLAndTitle("Read [the brief](https://example.com/brief)")
+        precondition(markdown.title == "Read the brief")
+        precondition(markdown.url?.absoluteString == "https://example.com/brief")
+        let parenthesized = firstURLAndTitle("Read the brief (https://example.com/brief)")
+        precondition(parenthesized.title == "Read the brief")
         let afterPresentation = try String(contentsOf: QuickEntryStore.todoProcessingURL(), encoding: .utf8)
         precondition(afterPresentation == before)
         let entry = try QuickEntryStore.completeTodo(task)
@@ -32,11 +39,12 @@ struct ViewerTests {
         ### Active pipeline and sourcing
         - [ ] Review candidate feedback
         ### Waiting on recruiter / not owned yet
-        - Recruiter is arranging an initial chat.
+        - Recruiter is arranging an initial chat. Re-enter only if asked for an interview or decision. Source: https://example.com/recruiter/thread
         - [ ] Recruiter-owned follow-up, not an active task
 
         ## Owing
-        - [ ] Review the release
+        ### Week of Sep 8 — immediate follow-through
+          - [ ] Review the release. Source: https://example.com/release
         """
         let previousFingerprint = QuickEntryStore.todoStateFingerprint()
         try hiringFixture.write(to: QuickEntryStore.stateOfTheUnionURL(), atomically: true, encoding: .utf8)
@@ -102,7 +110,62 @@ struct ViewerTests {
         precondition(descendants(view).compactMap { $0 as? CASEContextRowView }.count == 2)
         precondition(descendants(view).compactMap { $0 as? CASETodoRowView }.count == 2)
         try render(view, to: root.appendingPathComponent("hiring.png"))
-        print("PASS: source preservation, completion/restore, duplicate lookup, link action isolation, title sizing, loading ink alignment, Hiring order/sections/waiting/refresh")
+        let stateBeforeBrowsing = try String(contentsOf: QuickEntryStore.stateOfTheUnionURL(), encoding: .utf8)
+        let inboxBeforeBrowsing = try String(contentsOf: QuickEntryStore.todoProcessingURL(), encoding: .utf8)
+        func goBack() {
+            let back = descendants(view).compactMap { $0 as? CASEHeaderActionView }.first { $0.accessibilityLabel() == "Back to Today" }!
+            precondition(back.accessibilityPerformPress())
+            view.layoutSubtreeIfNeeded()
+        }
+        func openSection(_ name: String) {
+            let action = descendants(view).compactMap { $0 as? CASEMenuActionView }.first { $0.accessibilityLabel() == name }!
+            action.mouseDown(with: click)
+            view.layoutSubtreeIfNeeded()
+        }
+        func verifyHeader() {
+            let header = descendants(view).compactMap { $0 as? CASEMenuHeaderView }.first!
+            let fields = header.subviews.compactMap { $0 as? NSTextField }
+            precondition(abs(fields[0].alignmentRect(forFrame: fields[0].frame).minX - TodoLayout.titleLeading) < 0.5)
+            precondition(abs(fields[0].frame.minX - fields[1].frame.minX) < 0.5)
+            let back = header.subviews.compactMap { $0 as? CASEHeaderActionView }.first!
+            let symbol = back.subviews.compactMap { $0 as? NSImageView }.first!
+            precondition(symbol.image != nil)
+            let symbolAlignment = symbol.alignmentRect(forFrame: symbol.frame)
+            precondition(abs(symbolAlignment.midX - back.bounds.midX) < 0.5)
+            precondition(abs(symbolAlignment.midY - back.bounds.midY) < 0.5)
+            precondition(abs(back.frame.midY - header.bounds.midY) < 0.5)
+            precondition(header.frame.height == 56)
+            for label in descendants(view).compactMap({ $0 as? NSTextField }) {
+                precondition(!label.stringValue.contains("https://"), "Unpackaged URL in \(label.stringValue)")
+            }
+        }
+        verifyHeader()
+        let contexts = descendants(view).compactMap { $0 as? CASEContextRowView }
+        precondition(descendants(contexts[0]).contains { $0 is CASELinkButton })
+        goBack()
+        for name in ["Owing", "Inbox", "Logbook"] {
+            openSection(name)
+            verifyHeader()
+            try render(view, to: root.appendingPathComponent(name.lowercased() + ".png"))
+            goBack()
+        }
+        let stateAfterBrowsing = try String(contentsOf: QuickEntryStore.stateOfTheUnionURL(), encoding: .utf8)
+        let inboxAfterBrowsing = try String(contentsOf: QuickEntryStore.todoProcessingURL(), encoding: .utf8)
+        precondition(stateAfterBrowsing == stateBeforeBrowsing)
+        precondition(inboxAfterBrowsing == inboxBeforeBrowsing)
+        _ = try QuickEntryStore.completeTodo(QuickEntryStore.todoItems(in: .owing).first!)
+        controller.rebuild()
+        openSection("Logbook")
+        verifyHeader()
+        precondition(descendants(view).contains { $0 is CASELinkButton })
+        try render(view, to: root.appendingPathComponent("logbook-populated.png"))
+        goBack()
+        try "## Owing\n".write(to: QuickEntryStore.stateOfTheUnionURL(), atomically: true, encoding: .utf8)
+        openSection("Owing")
+        verifyHeader()
+        precondition(view.frame.height < 180, "Empty source view reserves unnecessary blank space")
+        try render(view, to: root.appendingPathComponent("owing-empty.png"))
+        print("PASS: source preservation, completion/restore, duplicate lookup, link action isolation, title sizing, loading ink alignment, Hiring order/sections/waiting/refresh, all section headers/back controls, context and Logbook links, compact empty states")
         print("Snapshots: \(root.path)")
     }
 

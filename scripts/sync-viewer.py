@@ -10,7 +10,8 @@ from pathlib import Path
 COMPONENTS = [
     ("private enum TodoLayout {", "\nenum ModeTextRollDirection"),
     ("private func firstURLAndTitle(", "\nprivate func conciseMetadata"),
-    ("final class CASEMenuLoadingView:", "\nfinal class CASEMenuEmptyView"),
+    ("final class CASEMenuHeaderView:", "\nfinal class CASEMenuEmptyView"),
+    ("final class CASELogbookRowView:", "\nfinal class CASECheckboxView"),
     ("final class CASELinkButton:", "\nfinal class CASESpinnerView"),
     ("final class CASEShimmerLabel:", "\nfinal class CASEModeTabs"),
     ("final class CASEContextRowView:", "\nfinal class CASEMenuActionView"),

@@ -158,20 +158,30 @@ private func todoPresentation(_ raw: String) -> TodoPresentation {
 }
 
 private func firstURLAndTitle(_ raw: String) -> (title: String, url: URL?) {
-    guard let expression = try? NSRegularExpression(pattern: #"https?://\S+"#),
-          let match = expression.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)),
-          let range = Range(match.range, in: raw)
-    else {
+    // Replace a Markdown link as a unit, retaining its human-readable label.
+    // Bare URLs use NSDataDetector so sentence punctuation stays out of the URL.
+    let markdown = try? NSRegularExpression(pattern: #"\[([^\]]+)\]\((https?://[^\s]+)\)"#)
+    var title = raw
+    let url: URL?
+    if let match = markdown?.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)),
+       let whole = Range(match.range, in: raw),
+       let label = Range(match.range(at: 1), in: raw),
+       let destination = Range(match.range(at: 2), in: raw) {
+        url = URL(string: String(raw[destination]))
+        title.replaceSubrange(whole, with: String(raw[label]))
+    } else if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue),
+              let match = detector.matches(in: raw, range: NSRange(raw.startIndex..., in: raw)).first(where: { ["http", "https"].contains($0.url?.scheme ?? "") }),
+              let range = Range(match.range, in: raw) {
+        url = match.url
+        title.replaceSubrange(range, with: "")
+    } else {
         return (raw, nil)
     }
-
-    let candidate = String(raw[range]).trimmingCharacters(in: CharacterSet(charactersIn: "()[]{}<>.,;:"))
-    var title = raw.replacingCharacters(in: range, with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-    if title.hasSuffix(":") {
-        title.removeLast()
-        title += "."
-    }
-    return (title, URL(string: candidate))
+    title = title.replacingOccurrences(of: #"\(\s*\)|<\s*>|\[\s*\]"#, with: "", options: .regularExpression)
+        .replacingOccurrences(of: #"(?i)\s*\b(?:source|link):\s*[.,]?\s*$"#, with: "", options: .regularExpression)
+        .components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+    if title.hasSuffix(":") { title.removeLast(); title += "." }
+    return (title.isEmpty ? "Open link" : title, url)
 }
 
 private func conciseMetadata(_ detail: String, category: String?) -> String {
@@ -818,7 +828,7 @@ final class TodoPopoverController: NSViewController {
     private let onPreferredSizeChange: (NSSize) -> Void
     private let card = NSView()
     private let headerContainer = NSView()
-    private let headerHeight: CGFloat = 64
+    private let headerHeight: CGFloat = 56
     private let scroll = NSScrollView()
     private let stack = CASEMenuStackView()
     private var topListFade: CASETextInputEdgeFade?
@@ -899,7 +909,7 @@ final class TodoPopoverController: NSViewController {
         stack.alignment = .leading
         stack.distribution = .fill
         stack.spacing = 0
-        stack.edgeInsets = NSEdgeInsets(top: 10, left: 0, bottom: 10, right: 0)
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 8, right: 0)
 
         scrollBoundsObserver = NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
@@ -1209,8 +1219,9 @@ final class TodoPopoverController: NSViewController {
                     add(CASEMenuSectionView(title: context))
                     previousContext = context
                 }
-                let detail = source == .inbox ? (todo.timestamp ?? "Inbox") : ""
-                add(CASETodoRowView(todo: todo, detail: detail, onToggle: onToggle))
+                // The section heading already supplies this context. Repeating
+                // the capture timestamp in each row wastes a metadata line.
+                add(CASETodoRowView(todo: todo, detail: "", onToggle: onToggle))
             }
         }
 
@@ -1377,7 +1388,7 @@ final class TodoPopoverController: NSViewController {
         let verticalPadding = stack.edgeInsets.top + stack.edgeInsets.bottom
         let contentHeight = max(1, rowHeights + spacing + verticalPadding)
         let maximumListHeight: CGFloat = 620 - headerHeight - 8
-        let visibleHeight = min(max(contentHeight, 180), maximumListHeight)
+        let visibleHeight = min(max(contentHeight, 60), maximumListHeight)
         stack.frame = NSRect(x: 0, y: 0, width: width, height: contentHeight)
         scroll.hasVerticalScroller = contentHeight > visibleHeight
         let nextPreferredSize = NSSize(width: width + 8, height: visibleHeight + headerHeight + 8)
@@ -1427,7 +1438,7 @@ final class CASEMenuHeaderView: NSView {
         onAction: (() -> Void)? = nil,
         onBack: (() -> Void)? = nil
     ) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: 64))
+        super.init(frame: NSRect(x: 0, y: 0, width: TodoLayout.width, height: 56))
         wantsLayer = true
         layer?.backgroundColor = qColor(0xfbfbfc).cgColor
 
@@ -1446,23 +1457,23 @@ final class CASEMenuHeaderView: NSView {
         addSubview(subtitleView)
 
         var constraints = [
-            titleView.topAnchor.constraint(equalTo: topAnchor, constant: 16),
+            titleView.topAnchor.constraint(equalTo: topAnchor, constant: 12),
             subtitleView.leadingAnchor.constraint(equalTo: titleView.leadingAnchor),
             subtitleView.topAnchor.constraint(equalTo: titleView.bottomAnchor, constant: 1),
         ]
 
         if let onBack {
-            let back = CASEHeaderActionView(icon: "‹", accessibilityLabel: "Back to Today", isEnabled: true, onPress: onBack)
+            let back = CASEHeaderActionView(icon: "chevron.left", accessibilityLabel: "Back to Today", isEnabled: true, onPress: onBack)
             back.translatesAutoresizingMaskIntoConstraints = false
             addSubview(back)
             constraints += [
-                back.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-                // Align the back affordance with the title, not the two-line
-                // header block; centering it in the whole header read low.
-                back.centerYAnchor.constraint(equalTo: titleView.centerYAnchor),
+                back.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+                // Center the symbol control beside the complete title/subtitle
+                // block; its text rail matches the task titles below.
+                back.centerYAnchor.constraint(equalTo: centerYAnchor),
                 back.widthAnchor.constraint(equalToConstant: 30),
                 back.heightAnchor.constraint(equalToConstant: 30),
-                titleView.leadingAnchor.constraint(equalTo: back.trailingAnchor, constant: 8),
+                titleView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: TodoLayout.titleLeading),
             ]
         } else {
             constraints.append(titleView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20))
@@ -1508,19 +1519,32 @@ final class CASEHeaderActionView: NSView {
         setAccessibilityRole(.button)
         setAccessibilityLabel(accessibilityLabel)
 
-        let label = NSTextField(labelWithString: icon)
-        label.font = .systemFont(ofSize: 17, weight: .medium)
-        label.textColor = qColor(0x3f4650)
-        label.alignment = .center
-        label.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(label)
+        let symbol = NSImageView()
+        let name = icon == "↻" ? "arrow.clockwise" : icon
+        symbol.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
+        symbol.contentTintColor = qColor(0x3f4650)
+        symbol.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(symbol)
         NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            symbol.centerXAnchor.constraint(equalTo: centerXAnchor),
+            symbol.centerYAnchor.constraint(equalTo: centerYAnchor),
+            symbol.widthAnchor.constraint(equalToConstant: 16),
+            symbol.heightAnchor.constraint(equalToConstant: 16),
         ])
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        super.hitTest(point) == nil ? nil : self
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard isActionEnabled else { return false }
+        onPress()
+        return true
+    }
 
     override func mouseDown(with event: NSEvent) {
         guard isActionEnabled else { return }
@@ -1534,7 +1558,7 @@ final class CASEHeaderActionView: NSView {
 
 final class CASEMenuSectionView: NSView {
     init(title: String) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 368, height: 36))
+        super.init(frame: NSRect(x: 0, y: 0, width: TodoLayout.width, height: 28))
         wantsLayer = true
         layer?.backgroundColor = qColor(0xfbfbfc).cgColor
 
@@ -1545,7 +1569,8 @@ final class CASEMenuSectionView: NSView {
         addSubview(label)
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 3),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -20),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
@@ -1672,20 +1697,31 @@ final class CASEMenuEmptyView: NSView {
 
 final class CASEContextRowView: NSView {
     init(text: String) {
-        let label = NSTextField(wrappingLabelWithString: text)
-        label.font = .systemFont(ofSize: 11)
-        label.textColor = qColor(0x7d8590)
+        let presentation = firstURLAndTitle(text)
+        let label = NSTextField(wrappingLabelWithString: "")
+        label.attributedStringValue = markdownLabel(presentation.title, font: .systemFont(ofSize: 11), color: qColor(0x7d8590))
         label.translatesAutoresizingMaskIntoConstraints = false
-        let width = TodoLayout.width - 50 + label.alignmentRectInsets.left + label.alignmentRectInsets.right
+        let link = presentation.url.map { url in CASELinkButton { NSWorkspace.shared.open(url) } }
+        let trailing = TodoLayout.trailing + (link == nil ? 0 : TodoLayout.actionSize + TodoLayout.actionGap)
+        let width = TodoLayout.width - 20 - trailing + label.alignmentRectInsets.left + label.alignmentRectInsets.right
         let height = ceil(label.cell!.cellSize(forBounds: NSRect(x: 0, y: 0, width: width, height: .greatestFiniteMagnitude)).height)
-        super.init(frame: NSRect(x: 0, y: 0, width: TodoLayout.width, height: height + 16))
+        super.init(frame: NSRect(x: 0, y: 0, width: TodoLayout.width, height: max(height + 16, link == nil ? 0 : 46)))
         addSubview(label)
+        if let link { addSubview(link) }
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 25),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -25),
-            label.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -trailing),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             label.heightAnchor.constraint(equalToConstant: height),
         ])
+        if let link {
+            NSLayoutConstraint.activate([
+                link.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -TodoLayout.trailing),
+                link.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+                link.widthAnchor.constraint(equalToConstant: TodoLayout.actionSize),
+                link.heightAnchor.constraint(equalToConstant: TodoLayout.actionSize),
+            ])
+        }
     }
     required init?(coder: NSCoder) { nil }
 }
@@ -1787,12 +1823,17 @@ final class CASELogbookRowView: NSView {
         self.onRestore = onRestore
         let presentation = todoPresentation(entry.text)
         let titleFont = NSFont.systemFont(ofSize: 12, weight: .medium)
-        let title = markdownLabel(presentation.title, font: titleFont, color: qColor(0x30353d))
-        let titleWidth: CGFloat = 238
-        let titleHeight = ceil(title.boundingRect(
-            with: NSSize(width: titleWidth, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]
-        ).height)
+        let titleAndURL = firstURLAndTitle(presentation.title)
+        let title = markdownLabel(titleAndURL.title, font: titleFont, color: qColor(0x30353d))
+        let titleView = NSTextField(wrappingLabelWithString: "")
+        titleView.attributedStringValue = title
+        titleView.translatesAutoresizingMaskIntoConstraints = false
+        let link = titleAndURL.url.map { url in CASELinkButton { NSWorkspace.shared.open(url) } }
+        let titleWidth = TodoLayout.width - 25 - 12 - 10 - 52 - 8
+            - (link == nil ? 0 : TodoLayout.actionSize + TodoLayout.actionGap)
+            + titleView.alignmentRectInsets.left + titleView.alignmentRectInsets.right
+        let titleHeight = ceil(titleView.cell!.cellSize(forBounds:
+            NSRect(x: 0, y: 0, width: titleWidth, height: .greatestFiniteMagnitude)).height)
         let rowHeight = max(CGFloat(62), 14 + titleHeight + 3 + 13 + 14)
         super.init(frame: NSRect(x: 0, y: 0, width: 368, height: rowHeight))
         wantsLayer = true
@@ -1806,14 +1847,6 @@ final class CASELogbookRowView: NSView {
         card.layer?.cornerCurve = .continuous
         card.translatesAutoresizingMaskIntoConstraints = false
         addSubview(card)
-
-        let titleView = NSTextField(labelWithString: "")
-        titleView.attributedStringValue = title
-        titleView.maximumNumberOfLines = 0
-        titleView.lineBreakMode = .byWordWrapping
-        titleView.cell?.wraps = true
-        titleView.cell?.isScrollable = false
-        titleView.translatesAutoresizingMaskIntoConstraints = false
 
         let detailView = NSTextField(labelWithString: conciseMetadata("\(entry.source.title) · \(completedAt)", category: presentation.category))
         detailView.font = .systemFont(ofSize: 10, weight: .regular)
@@ -1837,6 +1870,7 @@ final class CASELogbookRowView: NSView {
         card.addSubview(titleView)
         card.addSubview(detailView)
         card.addSubview(restorePill)
+        if let link { card.addSubview(link) }
         NSLayoutConstraint.activate([
             card.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             card.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
@@ -1845,7 +1879,7 @@ final class CASELogbookRowView: NSView {
 
             titleView.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
             titleView.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
-            titleView.trailingAnchor.constraint(equalTo: restorePill.leadingAnchor, constant: -8),
+            titleView.trailingAnchor.constraint(equalTo: link?.leadingAnchor ?? restorePill.leadingAnchor, constant: -8),
             titleView.heightAnchor.constraint(equalToConstant: titleHeight),
 
             detailView.leadingAnchor.constraint(equalTo: titleView.leadingAnchor),
@@ -1860,6 +1894,14 @@ final class CASELogbookRowView: NSView {
             restoreLabel.centerXAnchor.constraint(equalTo: restorePill.centerXAnchor),
             restoreLabel.centerYAnchor.constraint(equalTo: restorePill.centerYAnchor),
         ])
+        if let link {
+            NSLayoutConstraint.activate([
+                link.trailingAnchor.constraint(equalTo: restorePill.leadingAnchor, constant: -TodoLayout.actionGap),
+                link.centerYAnchor.constraint(equalTo: restorePill.centerYAnchor),
+                link.widthAnchor.constraint(equalToConstant: TodoLayout.actionSize),
+                link.heightAnchor.constraint(equalToConstant: TodoLayout.actionSize),
+            ])
+        }
     }
 
     required init?(coder: NSCoder) { nil }
