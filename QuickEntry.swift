@@ -1561,7 +1561,7 @@ final class CASEMenuLoadingView: NSView {
             card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
             // Match the text rail used by Owing, Inbox, and Logbook. The
             // spinner is a status affordance, so it belongs at the far edge.
-            titleLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
+            titleLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
             titleLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
             titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: spinner.leadingAnchor, constant: -10),
             statusLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
