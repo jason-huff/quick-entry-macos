@@ -1,6 +1,6 @@
 # Quick Entry for macOS
 
-> **Credit:** This mini-app began with [Jon Rundle](https://github.com/jonrundle)’s work and design. Jason Huff is iterating on it for a lightweight macOS capture workflow.
+> **Credit:** This mini-app was created by [Jon Rundle](https://github.com/jonrundle). This is a riff on his work. Thank you Jon!
 
 A lightweight macOS menu-bar helper for catching a thought before it disappears.
 
