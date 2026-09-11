@@ -1561,7 +1561,7 @@ final class CASEMenuLoadingView: NSView {
             card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
             // Match the text rail used by Owing, Inbox, and Logbook. The
             // spinner is a status affordance, so it belongs at the far edge.
-            titleLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
+            titleLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
             titleLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
             titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: spinner.leadingAnchor, constant: -10),
             statusLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
@@ -1845,28 +1845,62 @@ final class CASECheckboxView: NSView {
     }
 }
 
-final class CASELinkButton: NSButton {
+final class CASELinkButton: NSView {
     private let onOpen: () -> Void
+    private let icon = NSImageView()
 
-    init(title: String, onOpen: @escaping () -> Void) {
+    init(onOpen: @escaping () -> Void) {
         self.onOpen = onOpen
         super.init(frame: .zero)
-        self.title = title
-        isBordered = false
-        bezelStyle = .inline
-        font = .systemFont(ofSize: 10, weight: .medium)
-        contentTintColor = .linkColor
-        target = self
-        action = #selector(open)
+        wantsLayer = true
+        layer?.backgroundColor = qColor(0xf0f2f5).cgColor
+        layer?.cornerRadius = 9
+        layer?.cornerCurve = .continuous
         setAccessibilityRole(.link)
-        setAccessibilityLabel(title)
+        setAccessibilityLabel("Open link")
         translatesAutoresizingMaskIntoConstraints = false
+
+        let configuration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        icon.image = NSImage(systemSymbolName: "link", accessibilityDescription: "Open link")?.withSymbolConfiguration(configuration)
+        icon.contentTintColor = qColor(0x3f4650)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(icon)
+        NSLayoutConstraint.activate([
+            icon.centerXAnchor.constraint(equalTo: centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
     }
 
     required init?(coder: NSCoder) { nil }
 
-    @objc private func open() {
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseEnteredAndExited], owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        setHovered(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setHovered(false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
         onOpen()
+    }
+
+    private func setHovered(_ hovered: Bool) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.15)
+            layer?.backgroundColor = (hovered ? qColor(0xdbeafe) : qColor(0xf0f2f5)).cgColor
+            CATransaction.commit()
+            icon.animator().contentTintColor = hovered ? qColor(0x2563eb) : qColor(0x3f4650)
+        }
     }
 }
 
@@ -1932,7 +1966,7 @@ final class CASETodoRowView: NSView {
         addSubview(note)
 
         let linkButton: CASELinkButton? = titleAndURL.url.map { url in
-            let button = CASELinkButton(title: "Open ↗") {
+            let button = CASELinkButton {
                 NSWorkspace.shared.open(url)
             }
             addSubview(button)
