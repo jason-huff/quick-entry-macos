@@ -6,3 +6,8 @@ build/
 
 # Local logs and app output
 *.log
+
+# Local Python helpers, caches, and test output
+__pycache__/
+*.pyc
+.cache/

@@ -27,6 +27,12 @@ PI_THINKING="${QUICK_ENTRY_PI_THINKING:-off}"
 TODO_COMPANION="${QUICK_ENTRY_TODO_COMPANION:-0}"
 LAUNCH_PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 PI_MODEL_PLIST=""
+AGENT_PLIST=""
+if [[ -n "${QUICK_ENTRY_AGENT:-}" ]]; then
+  # Escape user-supplied paths when serializing XML.
+  escaped_agent="$(printf '%s' "$QUICK_ENTRY_AGENT" | /usr/bin/python3 -c 'import sys; from xml.sax.saxutils import escape; print(escape(sys.stdin.read()), end="")')"
+  AGENT_PLIST="    <key>QUICK_ENTRY_AGENT</key><string>$escaped_agent</string>"
+fi
 
 if [[ "$TODO_COMPANION" != "0" && "$TODO_COMPANION" != "1" ]]; then
   echo "QUICK_ENTRY_TODO_COMPANION must be 0 or 1" >&2
@@ -78,6 +84,7 @@ $todo_arg
     <key>QUICK_ENTRY_TODOS</key><string>$embedded_todos</string>
     <key>QUICK_ENTRY_PI_THINKING</key><string>$PI_THINKING</string>
 $PI_MODEL_PLIST
+$AGENT_PLIST
   </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><false/>
   <key>StandardOutPath</key><string>/tmp/$log_prefix.out.log</string>
@@ -89,6 +96,7 @@ PLIST
 rm -rf "$APP" "$TODO_APP" "$ICONSET"
 mkdir -p "$MACOS" "$RESOURCES/skills/write-without-bullshit"
 cp "$ROOT/preprocess-inbox.py" "$RESOURCES/preprocess-inbox.py"
+cp "$ROOT/agent_runner.py" "$RESOURCES/agent_runner.py"
 cp "$ROOT/refresh-hyperd-todos.py" "$RESOURCES/refresh-hyperd-todos.py"
 chmod 755 "$RESOURCES/preprocess-inbox.py" "$RESOURCES/refresh-hyperd-todos.py"
 install -m 755 "$ROOT/polish-writing.sh" "$RESOURCES/polish-writing.sh"
@@ -115,6 +123,12 @@ swiftc -gnone -parse-as-library "$ROOT/QuickEntry.swift" -o "$MACOS/$EXECUTABLE"
 if [[ "$TODO_COMPANION" == "1" ]]; then
   cp -R "$APP" "$TODO_APP"
   write_info_plist "$TODO_APP" "$TODO_APP_NAME" "$TODO_BUNDLE_ID"
+fi
+
+# Test builds must not overwrite login agents or installed apps.
+if [[ "${QUICK_ENTRY_SKIP_INSTALL:-0}" == "1" ]]; then
+  echo "Built $APP (install skipped)"
+  exit 0
 fi
 
 mkdir -p "$INSTALL_DIR" "$LAUNCH_AGENT_DIR"

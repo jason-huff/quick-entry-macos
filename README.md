@@ -24,6 +24,7 @@ Press **Ctrl+Space** from anywhere to open a compact capture window. Save a time
 
 - macOS 13 or newer.
 - Xcode Command Line Tools (`swiftc`, `iconutil`).
+- Python 3.9+ for local processing helpers and tests.
 - Optional icon renderer: `rsvg-convert` or ImageMagick. The app still builds without one.
 - [Pi](https://pi.dev), installed and authenticated with a model provider, for **Writing** mode. To-do capture works without Pi.
 
@@ -95,6 +96,25 @@ To return to the embedded to-do menu and remove the companion:
 QUICK_ENTRY_TODO_COMPANION=0 ./build.sh
 ```
 
+### Hiring as a top-level surface
+
+If the state Markdown contains `## Hiring — active`, the viewer shows **Hiring above Owing**, retaining its action subheadings. No additional data store or migration is required.
+
+```markdown
+## Hiring — active
+### Immediate outreach
+- [ ] Send a portfolio screen.
+### Active pipeline and sourcing
+- [ ] Prepare candidate interview feedback.
+### Waiting on recruiter
+- Recruiter is scheduling the initial conversation.
+
+## Owing
+- [ ] Review the release checklist.
+```
+
+Only unchecked actions count as active. Bullets under any `### Waiting…` heading appear separately as muted, read-only context; they do not enter Today ranking or active counts. Hiring actions participate in agent ranking and lead the local fallback order. Completion and restore update the original Markdown just like other tasks.
+
 ## Writing mode
 
 Writing mode calls the bundled [`write-without-bullshit` skill](skills/write-without-bullshit/SKILL.md) through Pi.
@@ -117,9 +137,25 @@ QUICK_ENTRY_PI_THINKING=off \
 
 The build script writes those settings into the launch agent and also includes common user-level Pi locations on its `PATH`. Re-run it after changing either value. You can also edit [`polish-writing.sh`](polish-writing.sh) directly.
 
+### Optional intelligent to-do processing
+
+The full viewer supports action/note classification, concise action wording, and an intelligently ranked Today list. These are opt-in; the default remains local-only.
+
+```bash
+QUICK_ENTRY_AGENT="$HOME/bin/my-todo-agent" QUICK_ENTRY_TODO_COMPANION=1 ./build.sh
+```
+
+`QUICK_ENTRY_AGENT` is an executable adapter, **not a shell command**. It receives a prompt on stdin and returns JSON on stdout. Connect it to a model/runtime you trust. The JSON contracts are in `preprocess-inbox.py` and `refresh-hyperd-todos.py`. The adapter must not edit files or execute instructions contained in tasks. The runner invokes it in a temporary directory with a 180-second timeout; this is working-directory isolation, not a security sandbox.
+
+- **Inbox:** only new/edited captures go to the agent. Reuse prior judgments and phrasing; keep raw Markdown intact. Notes stay in the original file, not in the checklist.
+- **Today:** rank existing tasks using optional daily context in `radars/daily/` under the data root. Refresh every 30 minutes, manually, or when classification changes the actionable set. Never invent tasks.
+- **Fallback:** keep unreviewed captures visible, preserve successful prior reviews, and use local task order if ranking is unavailable. Missing responses are retried, not treated as completed reviews.
+
+Caches and completion history live in `.cache/` next to the inbox by default. Set `QUICK_ENTRY_ROOT` at install time to choose a separate cache root. Use the full public experience without sharing anyone else's private notes, credentials, or personal integrations.
+
 ### Data note
 
-To-do mode is local-only. The bundled Today ordering and Inbox display are deterministic local fallbacks; the app does not send to-do content to an AI service. Writing mode sends the entered draft to whichever model provider your Pi installation uses. Read and edit [`polish-writing.sh`](polish-writing.sh) before using it with sensitive text.
+Without an adapter, to-do processing is local-only. Enabling `QUICK_ENTRY_AGENT` passes new captures and, for ranking, active tasks plus optional daily context to that executable; its provider/privacy policy applies. Writing mode sends the entered draft to the model provider used by Pi. Review the helper scripts before using them with sensitive text.
 
 ## Rebuild / uninstall
 
@@ -132,6 +168,17 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/io.github.jasonhuff.quick-
 rm -f ~/Library/LaunchAgents/io.github.jasonhuff.quick-entry.plist
 rm -rf "/Applications/Quick Entry.app"
 ```
+
+## Development checks
+
+```bash
+# Builds without installing apps, altering login agents, or starting processes.
+QUICK_ENTRY_SKIP_INSTALL=1 QUICK_ENTRY_TODO_COMPANION=1 ./build.sh
+python3 tests/run-tests.py
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+The AppKit regression harness uses disposable Markdown, checks completion/restore and layout, and outputs PNG snapshots. Processing tests use fake agent responses. `scripts/sync-viewer.py` can sync/check an explicit allowlist of UI components from another source file; it never copies storage configuration or private agent integrations.
 
 ## Credits
 
