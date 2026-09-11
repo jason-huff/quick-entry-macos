@@ -129,7 +129,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private var embeddedTodoMenuEnabled: Bool {
-        ProcessInfo.processInfo.environment["QUICK_ENTRY_TODOS"] != "0"
+        // The optional companion owns the to-do surface. Only show the legacy
+        // embedded menu when the launch agent explicitly requests it, so a
+        // direct/Spotlight launch cannot create a second checklist icon.
+        ProcessInfo.processInfo.environment["QUICK_ENTRY_TODOS"] == "1"
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
